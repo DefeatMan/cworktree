@@ -1,0 +1,573 @@
+#!/usr/bin/env bash
+#
+# cworktree — create a git worktree under <repo-root>/.claude/worktrees/<name>
+#                   and optionally launch Claude Code in it.
+#
+# Works from anywhere inside a git repository (including from another worktree);
+# worktrees are always created relative to the *main* repository root.
+#
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 kxwild
+
+set -euo pipefail
+
+PROG=${0##*/}
+DEFAULT_BASE_DIR=${CWORKTREE_DIR:-.claude/worktrees}
+# Directory layout Claude Code itself uses; when the base dir matches it,
+# `claude --worktree <name>` reuses the worktree created here instead of
+# creating a second one.
+CLAUDE_BASE_DIR=.claude/worktrees
+# Arguments to pass to `claude` when -c/--claude is given without any; nothing
+# is passed by default.
+DEFAULT_CLAUDE_ARGS=${CWORKTREE_CLAUDE_ARGS-}
+
+if [ -t 2 ]; then
+	C_RED=$'\033[31m'; C_YEL=$'\033[33m'; C_GRN=$'\033[32m'; C_DIM=$'\033[2m'; C_OFF=$'\033[0m'
+else
+	C_RED=; C_YEL=; C_GRN=; C_DIM=; C_OFF=
+fi
+
+die()  { printf '%s%s: %s%s\n' "$C_RED" "$PROG" "$*" "$C_OFF" >&2; exit 1; }
+warn() { printf '%s%s: %s%s\n' "$C_YEL" "$PROG" "$*" "$C_OFF" >&2; }
+info() { printf '%s%s%s\n' "$C_DIM" "$*" "$C_OFF" >&2; }
+ok()   { printf '%s%s%s\n' "$C_GRN" "$*" "$C_OFF" >&2; }
+
+usage() {
+	cat <<EOF
+Usage: $PROG [options] <worktree-name> [HEAD|commit|branch|remote-branch]
+       $PROG --cd <worktree-name>|..
+       $PROG --list
+       $PROG --shell-init [bash|zsh]
+
+Create a git worktree at <repo-root>/$DEFAULT_BASE_DIR/<worktree-name>, based on
+the given start point (default: HEAD). By default a new branch named after the
+worktree is created; use --checkout or --detach to change that.
+
+Options:
+  -c, --claude [args]   after a successful create, launch Claude Code in the
+                        worktree (in the current terminal):
+                          claude --worktree <worktree-name> [args]
+                        [args] is optional: a single string of extra claude
+                        arguments, parsed like a shell command line, e.g.
+                          -c '--chrome --dangerously-skip-permissions'
+                        It is only recognised when it starts with '-' and is
+                        not a $PROG option; otherwise write --claude=<args>
+                        or pass the arguments after '--'. Without [args],
+                        \$CWORKTREE_CLAUDE_ARGS is used.
+  -b, --branch <name>   name for the new branch (default: <worktree-name>)
+  -B, --reset-branch    reset the branch to the start point if it already exists
+      --checkout        check out the given existing branch instead of
+                        creating a new one
+      --detach          detached HEAD at the start point, no branch
+  -f, --force           pass --force to \`git worktree add\` (e.g. to check out a
+                        branch that is already checked out elsewhere)
+  -D, --dir <path>      base dir for worktrees, relative to the repo root
+                        (default: $DEFAULT_BASE_DIR, env: CWORKTREE_DIR)
+      --no-exclude      do not add the base dir to .git/info/exclude
+      --no-fetch        do not auto-fetch when a remote branch is unknown
+  -p, --path            print the worktree path on stdout and exit
+  -n, --dry-run         show what would happen, change nothing
+  -h, --help            show this help
+  --                    everything after this is passed through to claude,
+                        appended after [args]
+
+Environment:
+  CWORKTREE_CLAUDE_ARGS default arguments for claude with -c/--claude, parsed
+                        like a shell command line; overridden by -c [args].
+                        Nothing is passed by default, so e.g.
+                          export CWORKTREE_CLAUDE_ARGS='--chrome'
+  CWORKTREE_DIR         default base dir for worktrees (see -D/--dir)
+
+Navigation:
+      --cd <name>       print the path of an existing worktree, so the shell
+                        wrapper can cd into it; '--cd ..' prints the repo root
+      --list            list existing worktree names under the base dir
+      --shell-init [sh] print shell code defining a cworktree wrapper (which
+                        makes --cd actually change directory) plus tab
+                        completion; [sh] is bash or zsh (default: \$SHELL)
+
+Shell integration (a child process cannot cd its parent, hence the wrapper):
+  # ~/.bashrc
+  eval "\$($PROG --shell-init bash)"
+  # ~/.zshrc  (after compinit)
+  eval "\$($PROG --shell-init zsh)"
+
+Examples:
+  $PROG fix-login                       # new branch fix-login from HEAD
+  $PROG fix-login origin/main --claude  # new branch tracking origin/main, then claude
+  $PROG fix-login -c '--chrome'         # ... and pass --chrome to claude
+  $PROG hotfix v1.2.3 --detach          # detached worktree at tag v1.2.3
+  $PROG review --checkout feature/x     # check out existing branch feature/x
+  $PROG --cd fix-login                  # cd into $DEFAULT_BASE_DIR/fix-login
+  $PROG --cd ..                         # cd back to the repo root
+EOF
+}
+
+# ---------------------------------------------------------------- arguments --
+
+NAME=
+START_POINT=
+BRANCH=
+BASE_DIR=$DEFAULT_BASE_DIR
+MODE=new            # new | checkout | detach
+LAUNCH=0
+RESET_BRANCH=0
+FORCE=0
+DO_EXCLUDE=1
+DO_FETCH=1
+PRINT_PATH=0
+DRY_RUN=0
+CD_TARGET=
+DO_CD=0
+DO_LIST=0
+SHELL_INIT=
+LAUNCH_ARGS=()       # from -c/--claude, or $CWORKTREE_CLAUDE_ARGS
+LAUNCH_ARGS_SET=0
+CLAUDE_ARGS=()       # everything after --
+SPLIT_ARGS=()
+
+need_arg() { [ "$#" -ge 2 ] || die "option $1 requires an argument"; }
+
+# Split $1 into words the way a shell would — quoting is honoured, filename
+# globbing is not — and leave the result in SPLIT_ARGS.
+shell_split() {
+	local rc=0
+	SPLIT_ARGS=()
+	set -f
+	eval "SPLIT_ARGS=($1)" 2>/dev/null || rc=$?
+	set +f
+	return "$rc"
+}
+
+add_launch_args() {  # $1 = string of claude arguments, $2 = source, for errors
+	shell_split "$1" || die "cannot parse $2: $1"
+	LAUNCH_ARGS_SET=1
+	[ "${#SPLIT_ARGS[@]}" -eq 0 ] || LAUNCH_ARGS+=("${SPLIT_ARGS[@]}")
+}
+
+# The argument of -c/--claude is optional, so only take the next word when it
+# can only have been meant for claude: option-looking, and none of ours.
+is_claude_args() {
+	case $1 in
+		-h|--help|-c|--claude|-b|--branch|-B|--reset-branch|--checkout\
+		|--detach|-f|--force|-D|--dir|--no-exclude|--no-fetch|-p|--path\
+		|--cd|--list|--shell-init|-n|--dry-run|--) return 1 ;;
+		--claude=*|--branch=*|--dir=*|--cd=*|--shell-init=*) return 1 ;;
+		-?*) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+while [ "$#" -gt 0 ]; do
+	case $1 in
+		-h|--help)          usage; exit 0 ;;
+		-c|--claude)
+			LAUNCH=1
+			if [ "$#" -ge 2 ] && is_claude_args "$2"; then
+				add_launch_args "$2" "claude arguments"; shift
+			fi
+			;;
+		--claude=*)         LAUNCH=1; add_launch_args "${1#*=}" "claude arguments" ;;
+		-b|--branch)        need_arg "$@"; BRANCH=$2; shift ;;
+		--branch=*)         BRANCH=${1#*=} ;;
+		-B|--reset-branch)  RESET_BRANCH=1 ;;
+		--checkout)         MODE=checkout ;;
+		--detach)           MODE=detach ;;
+		-f|--force)         FORCE=1 ;;
+		-D|--dir)           need_arg "$@"; BASE_DIR=$2; shift ;;
+		--dir=*)            BASE_DIR=${1#*=} ;;
+		--no-exclude)       DO_EXCLUDE=0 ;;
+		--no-fetch)         DO_FETCH=0 ;;
+		-p|--path)          PRINT_PATH=1 ;;
+		--cd)               need_arg "$@"; DO_CD=1; CD_TARGET=$2; shift ;;
+		--cd=*)             DO_CD=1; CD_TARGET=${1#*=} ;;
+		--list)             DO_LIST=1 ;;
+		--shell-init)       # the shell name is optional
+			SHELL_INIT=auto
+			case ${2-} in bash|zsh|sh) SHELL_INIT=$2; shift ;; esac
+			;;
+		--shell-init=*)     SHELL_INIT=${1#*=} ;;
+		-n|--dry-run)       DRY_RUN=1 ;;
+		--)                 shift; CLAUDE_ARGS=("$@"); break ;;
+		-*)                 die "unknown option: $1 (try --help)" ;;
+		*)
+			if [ -z "$NAME" ]; then
+				NAME=$1
+			elif [ -z "$START_POINT" ]; then
+				START_POINT=$1
+			else
+				die "unexpected argument: $1 (try --help)"
+			fi
+			;;
+	esac
+	shift
+done
+
+# -c/--claude without arguments of its own falls back to the environment.
+if [ "$LAUNCH" -eq 1 ] && [ "$LAUNCH_ARGS_SET" -eq 0 ]; then
+	add_launch_args "$DEFAULT_CLAUDE_ARGS" '$CWORKTREE_CLAUDE_ARGS'
+fi
+
+# --------------------------------------------------------- shell integration --
+
+# Emitted for `eval "$(cworktree --shell-init)"`: a wrapper function (a child
+# process cannot change its parent's directory, so --cd only prints the path and
+# the wrapper does the cd) plus tab completion.
+shell_init() {
+	local shell=$1 self=$SELF quoted
+	if [ "$shell" = auto ]; then
+		local login_shell=${SHELL-}
+		case ${login_shell##*/} in
+			zsh) shell=zsh ;;
+			*)   shell=bash ;;
+		esac
+	fi
+	quoted=${self//\'/\'\\\'\'}
+
+	cat <<-EOF
+		__cworktree_bin='$quoted'
+
+		cworktree() {
+		  local __cw_arg __cw_prev= __cw_cd=0 __cw_out
+		  for __cw_arg in "\$@"; do
+		    # skip the value of options that take one, so \`-b --cd\` is a branch name
+		    case \$__cw_prev in
+		      -b|--branch|-D|--dir) __cw_prev=\$__cw_arg; continue ;;
+		    esac
+		    case \$__cw_arg in
+		      --) break ;;
+		      --cd|--cd=*) __cw_cd=1 ;;
+		    esac
+		    __cw_prev=\$__cw_arg
+		  done
+		  if [ "\$__cw_cd" -eq 0 ]; then
+		    "\$__cworktree_bin" "\$@"
+		    return \$?
+		  fi
+		  __cw_out=\$("\$__cworktree_bin" "\$@") || return \$?
+		  [ -n "\$__cw_out" ] || return 1
+		  cd -- "\${__cw_out##*\$'\n'}"
+		}
+	EOF
+
+	if [ "$shell" = zsh ]; then
+		cat <<-'EOF'
+
+			__cworktree_names() {
+			  local -a n
+			  n=(${(f)"$("$__cworktree_bin" --list 2>/dev/null)"})
+			  print -r -- ${(F)${n:#}}
+			}
+
+			_cworktree() {
+			  local cur=${words[CURRENT]} prev=${words[CURRENT-1]}
+			  local -a cands
+			  if [[ $cur == --cd=* ]]; then
+			    compset -P '--cd='
+			    cands=(.. ${(f)"$(__cworktree_names)"})
+			    compadd -a cands
+			    return
+			  fi
+			  case $prev in
+			    --cd)
+			      cands=(.. ${(f)"$(__cworktree_names)"})
+			      compadd -a cands; return ;;
+			    -b|--branch)
+			      cands=(${(f)"$(git for-each-ref --format='%(refname:short)' refs/heads 2>/dev/null)"})
+			      compadd -a cands; return ;;
+			    -D|--dir)   _files -/; return ;;
+			    --shell-init) compadd bash zsh; return ;;
+			  esac
+			  if [[ $cur == -* ]]; then
+			    cands=(-c --claude -b --branch -B --reset-branch --checkout --detach
+			           -f --force -D --dir --no-exclude --no-fetch -p --path
+			           --cd --list --shell-init -n --dry-run -h --help)
+			    compadd -a cands; return
+			  fi
+			  cands=(${(f)"$(git for-each-ref --format='%(refname:short)' refs/heads refs/remotes refs/tags 2>/dev/null)"})
+			  compadd -a cands
+			}
+
+			(( $+functions[compdef] )) && compdef _cworktree cworktree
+		EOF
+	else
+		cat <<-'EOF'
+
+			_cworktree() {
+			  local cur prev names opts
+			  COMPREPLY=()
+			  cur=${COMP_WORDS[COMP_CWORD]}
+			  prev=${COMP_WORDS[COMP_CWORD-1]}
+			  opts='-c --claude -b --branch -B --reset-branch --checkout --detach
+			        -f --force -D --dir --no-exclude --no-fetch -p --path
+			        --cd --list --shell-init -n --dry-run -h --help'
+			  case $cur in
+			    --cd=*)
+			      names=$("$__cworktree_bin" --list 2>/dev/null)
+			      COMPREPLY=( $(compgen -P '--cd=' -W ".. $names" -- "${cur#--cd=}") )
+			      return 0 ;;
+			  esac
+			  case $prev in
+			    --cd)
+			      names=$("$__cworktree_bin" --list 2>/dev/null)
+			      COMPREPLY=( $(compgen -W ".. $names" -- "$cur") )
+			      return 0 ;;
+			    -b|--branch)
+			      COMPREPLY=( $(compgen -W "$(git for-each-ref --format='%(refname:short)' refs/heads 2>/dev/null)" -- "$cur") )
+			      return 0 ;;
+			    -D|--dir)
+			      COMPREPLY=( $(compgen -d -- "$cur") )
+			      return 0 ;;
+			    --shell-init)
+			      COMPREPLY=( $(compgen -W 'bash zsh' -- "$cur") )
+			      return 0 ;;
+			  esac
+			  if [[ $cur == -* ]]; then
+			    COMPREPLY=( $(compgen -W "$opts" -- "$cur") )
+			    return 0
+			  fi
+			  COMPREPLY=( $(compgen -W "$(git for-each-ref --format='%(refname:short)' refs/heads refs/remotes refs/tags 2>/dev/null)" -- "$cur") )
+			}
+
+			complete -F _cworktree cworktree
+		EOF
+	fi
+}
+
+if [ -n "$SHELL_INIT" ]; then
+	case $SHELL_INIT in
+		auto|bash|zsh|sh) ;;
+		*) die "--shell-init: unsupported shell: $SHELL_INIT (bash or zsh)" ;;
+	esac
+	[ "$SHELL_INIT" != sh ] || SHELL_INIT=bash
+	# Resolve this script to an absolute path so the wrapper works without $PATH.
+	SELF=$0
+	case $SELF in
+		*/*) ;;
+		*) SELF=$(command -v -- "$SELF" 2>/dev/null || printf '%s' "$SELF") ;;
+	esac
+	case $SELF in
+		*/*) SELF=$(cd "${SELF%/*}" && pwd)/${SELF##*/} ;;
+	esac
+	shell_init "$SHELL_INIT"
+	exit 0
+fi
+
+# ------------------------------------------------------------- mode checks ---
+
+if [ "$DO_CD" -eq 1 ] || [ "$DO_LIST" -eq 1 ]; then
+	[ "$DO_CD" -eq 0 ] || [ "$DO_LIST" -eq 0 ] || die "--cd and --list are mutually exclusive"
+	[ -z "$NAME" ] || die "unexpected argument: $NAME (try --help)"
+	if [ "$DO_CD" -eq 1 ]; then
+		case $CD_TARGET in
+			.|..) ;;
+			'')                 die "--cd requires a worktree name (or '..' for the repo root)" ;;
+			/*|-*)              die "invalid worktree name: $CD_TARGET" ;;
+			*..*)               die "invalid worktree name: $CD_TARGET" ;;
+			*[!A-Za-z0-9._/-]*) die "invalid worktree name: $CD_TARGET (allowed: A-Z a-z 0-9 . _ - /)" ;;
+		esac
+	fi
+else
+	[ -n "$NAME" ] || { usage >&2; exit 2; }
+	[ "$MODE" != detach ] || [ -z "$BRANCH" ] || die "--detach and --branch are mutually exclusive"
+	[ "$MODE" != checkout ] || [ -z "$BRANCH" ] || die "--checkout and --branch are mutually exclusive"
+
+	case $NAME in
+		/*|-*)        die "invalid worktree name: $NAME" ;;
+		*..*)         die "invalid worktree name: $NAME" ;;
+		*[!A-Za-z0-9._/-]*) die "invalid worktree name: $NAME (allowed: A-Z a-z 0-9 . _ - /)" ;;
+	esac
+fi
+
+# ------------------------------------------------------------ repo location --
+
+git rev-parse --git-dir >/dev/null 2>&1 || die "not inside a git repository"
+
+# --git-common-dir points at the main repo's .git even when run from a worktree.
+COMMON_DIR=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) \
+	|| COMMON_DIR=$(cd "$(git rev-parse --git-common-dir)" && pwd)
+[ -n "$COMMON_DIR" ] || die "cannot locate the repository"
+[ "$(git rev-parse --is-bare-repository)" = false ] || die "bare repositories are not supported"
+REPO_ROOT=$(dirname "$COMMON_DIR")
+
+BASE_DIR=${BASE_DIR%/}
+case $BASE_DIR in /*) die "--dir must be relative to the repo root: $BASE_DIR" ;; esac
+
+# ------------------------------------------------------------- list / --cd ---
+
+# Names of the registered worktrees living under <repo-root>/<base-dir>/.
+list_worktree_names() {
+	local prefix=$REPO_ROOT/$BASE_DIR/ key value
+	git -C "$REPO_ROOT" worktree list --porcelain | while read -r key value; do
+		[ "$key" = worktree ] || continue
+		case $value in
+			"$prefix"?*) printf '%s\n' "${value#"$prefix"}" ;;
+		esac
+	done | LC_ALL=C sort
+}
+
+if [ "$DO_LIST" -eq 1 ]; then
+	list_worktree_names
+	exit 0
+fi
+
+if [ "$DO_CD" -eq 1 ]; then
+	case $CD_TARGET in
+		.|..) CD_PATH=$REPO_ROOT ;;
+		*)
+			CD_PATH=$REPO_ROOT/$BASE_DIR/$CD_TARGET
+			if [ ! -d "$CD_PATH" ]; then
+				names=$(list_worktree_names)
+				[ -z "$names" ] || info "known worktrees: $(printf '%s' "$names" | tr '\n' ' ')"
+				die "no such worktree: $CD_TARGET (under $BASE_DIR/)"
+			fi
+			;;
+	esac
+	# Only the path goes to stdout: the shell wrapper cds into it.
+	printf '%s\n' "$CD_PATH"
+	[ -t 1 ] || exit 0
+	info "run \`eval \"\$($PROG --shell-init)\"\` to make --cd change directory"
+	exit 0
+fi
+
+WT_PATH=$REPO_ROOT/$BASE_DIR/$NAME
+
+if [ "$PRINT_PATH" -eq 1 ]; then
+	printf '%s\n' "$WT_PATH"
+	exit 0
+fi
+
+# ------------------------------------------------------------- start point ---
+
+START_POINT=${START_POINT:-HEAD}
+
+resolve() { git rev-parse --verify --quiet "$1^{commit}" >/dev/null 2>&1; }
+
+if ! resolve "$START_POINT"; then
+	# Unknown ref: if it looks like <known-remote>/<branch>, try fetching it once.
+	remote=${START_POINT%%/*}
+	rest=${START_POINT#*/}
+	if [ "$DO_FETCH" -eq 1 ] && [ "$remote" != "$START_POINT" ] \
+		&& git remote | grep -Fxq "$remote"; then
+		info "start point '$START_POINT' unknown, fetching from $remote..."
+		[ "$DRY_RUN" -eq 1 ] || git fetch --quiet "$remote" "$rest" || true
+	fi
+	resolve "$START_POINT" || die "cannot resolve start point: $START_POINT"
+fi
+
+IS_REMOTE_REF=0
+git show-ref --verify --quiet "refs/remotes/$START_POINT" && IS_REMOTE_REF=1 || true
+
+# --------------------------------------------------------------- worktrees ---
+
+worktree_registered() {  # $1 = absolute path
+	git worktree list --porcelain | grep -Fxq "worktree $1"
+}
+branch_in_use() {        # $1 = branch name
+	git worktree list --porcelain | grep -Fxq "branch refs/heads/$1"
+}
+branch_exists() {        # $1 = branch name
+	git show-ref --verify --quiet "refs/heads/$1"
+}
+
+ALREADY=0
+if worktree_registered "$WT_PATH"; then
+	ALREADY=1
+	warn "worktree already exists: $WT_PATH"
+elif [ -e "$WT_PATH" ]; then
+	die "path exists but is not a registered worktree: $WT_PATH"
+fi
+
+# ------------------------------------------------------------ build command --
+
+ADD_ARGS=()
+[ "$FORCE" -eq 1 ] && ADD_ARGS+=(--force)
+
+# Nothing to plan when the worktree is already there: re-running is a no-op
+# (and, with --claude, just launches the session again).
+if [ "$ALREADY" -eq 0 ]; then
+	case $MODE in
+		detach)
+			ADD_ARGS+=(--detach "$WT_PATH" "$START_POINT")
+			;;
+		checkout)
+			branch_exists "$START_POINT" || die "not an existing local branch: $START_POINT (drop --checkout to create one)"
+			if [ "$FORCE" -eq 0 ] && branch_in_use "$START_POINT"; then
+				die "branch '$START_POINT' is already checked out in another worktree (use --force)"
+			fi
+			ADD_ARGS+=("$WT_PATH" "$START_POINT")
+			;;
+		new)
+			BRANCH=${BRANCH:-$NAME}
+			git check-ref-format --branch "$BRANCH" >/dev/null 2>&1 \
+				|| die "invalid branch name: $BRANCH (use --branch to pick another)"
+			if branch_exists "$BRANCH" && [ "$RESET_BRANCH" -eq 0 ]; then
+				if [ "$FORCE" -eq 0 ] && branch_in_use "$BRANCH"; then
+					die "branch '$BRANCH' is already checked out in another worktree (use --force, -B to reset, or --branch)"
+				fi
+				warn "branch '$BRANCH' already exists; checking it out (start point '$START_POINT' ignored, use -B to reset it)"
+				ADD_ARGS+=("$WT_PATH" "$BRANCH")
+			else
+				if [ "$RESET_BRANCH" -eq 1 ]; then
+					ADD_ARGS+=(-B "$BRANCH")
+				else
+					ADD_ARGS+=(-b "$BRANCH")
+				fi
+				[ "$IS_REMOTE_REF" -eq 1 ] && ADD_ARGS+=(--track)
+				ADD_ARGS+=("$WT_PATH" "$START_POINT")
+			fi
+			;;
+	esac
+fi
+
+# ------------------------------------------------------------------ create ---
+
+if [ "$DRY_RUN" -eq 1 ]; then
+	[ "$ALREADY" -eq 1 ] || printf 'git -C %s worktree add %s\n' "$REPO_ROOT" "${ADD_ARGS[*]}"
+fi
+
+if [ "$ALREADY" -eq 0 ] && [ "$DRY_RUN" -eq 0 ]; then
+	mkdir -p "$(dirname "$WT_PATH")"
+	git -C "$REPO_ROOT" worktree add "${ADD_ARGS[@]}"
+fi
+
+# Keep the nested worktrees out of `git status` in the main repo.
+if [ "$DO_EXCLUDE" -eq 1 ] && [ "$DRY_RUN" -eq 0 ]; then
+	if ! git -C "$REPO_ROOT" check-ignore -q "$BASE_DIR/" 2>/dev/null; then
+		mkdir -p "$COMMON_DIR/info"
+		printf '/%s/\n' "$BASE_DIR" >>"$COMMON_DIR/info/exclude"
+		info "added /$BASE_DIR/ to .git/info/exclude"
+	fi
+fi
+
+if [ "$DRY_RUN" -eq 0 ]; then
+	head_desc=$(git -C "$WT_PATH" log -1 --format='%h %s' 2>/dev/null || echo '(no commits)')
+	branch_desc=$(git -C "$WT_PATH" symbolic-ref --short -q HEAD || echo "detached @ $(git -C "$WT_PATH" rev-parse --short HEAD)")
+	ok "worktree ready: $WT_PATH"
+	info "  branch: $branch_desc"
+	info "  head:   $head_desc"
+fi
+printf '%s\n' "$WT_PATH"
+
+# ------------------------------------------------------------------ claude ---
+
+[ "$LAUNCH" -eq 1 ] || exit 0
+command -v claude >/dev/null 2>&1 || die "claude not found in PATH"
+
+if [ "$BASE_DIR" = "$CLAUDE_BASE_DIR" ]; then
+	# Claude Code looks for worktrees in exactly this directory, so it reuses
+	# the one just created rather than making another.
+	CMD=(claude --worktree "$NAME")
+	CWD=$REPO_ROOT
+else
+	warn "base dir is not $CLAUDE_BASE_DIR; starting claude inside the worktree instead of with --worktree"
+	CMD=(claude)
+	CWD=$WT_PATH
+fi
+[ "${#LAUNCH_ARGS[@]}" -eq 0 ] || CMD+=("${LAUNCH_ARGS[@]}")
+[ "${#CLAUDE_ARGS[@]}" -eq 0 ] || CMD+=("${CLAUDE_ARGS[@]}")
+
+info "+ ${CMD[*]}"
+[ "$DRY_RUN" -eq 0 ] || exit 0
+cd "$CWD"
+exec "${CMD[@]}"
