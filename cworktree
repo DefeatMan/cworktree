@@ -54,6 +54,10 @@ Options:
                         not a $PROG option; otherwise write --claude=<args>
                         or pass the arguments after '--'. Without [args],
                         \$CWORKTREE_CLAUDE_ARGS is used.
+  -e, --effort <level>  pass --effort <level> to claude (low, medium, high,
+                        xhigh, max); implies -c/--claude. The level can also be
+                        given as its own flag: --low, --medium, --high, --xhigh,
+                        --max
   -b, --branch <name>   name for the new branch (default: <worktree-name>)
   -B, --reset-branch    reset the branch to the start point if it already exists
       --checkout        check out the given existing branch instead of
@@ -96,6 +100,8 @@ Examples:
   $PROG fix-login                       # new branch fix-login from HEAD
   $PROG fix-login origin/main --claude  # new branch tracking origin/main, then claude
   $PROG fix-login -c '--chrome'         # ... and pass --chrome to claude
+  $PROG fix-login --effort high         # claude with a high effort level
+  $PROG fix-login --max                 # ... same as --effort max
   $PROG hotfix v1.2.3 --detach          # detached worktree at tag v1.2.3
   $PROG review --checkout feature/x     # check out existing branch feature/x
   $PROG --cd fix-login                  # cd into $DEFAULT_BASE_DIR/fix-login
@@ -121,6 +127,7 @@ CD_TARGET=
 DO_CD=0
 DO_LIST=0
 SHELL_INIT=
+EFFORT=              # claude --effort <level>
 LAUNCH_ARGS=()       # from -c/--claude, or $CWORKTREE_CLAUDE_ARGS
 LAUNCH_ARGS_SET=0
 CLAUDE_ARGS=()       # everything after --
@@ -145,14 +152,26 @@ add_launch_args() {  # $1 = string of claude arguments, $2 = source, for errors
 	[ "${#SPLIT_ARGS[@]}" -eq 0 ] || LAUNCH_ARGS+=("${SPLIT_ARGS[@]}")
 }
 
+# An effort level is only useful together with claude, so asking for one asks
+# for a session too.
+set_effort() {       # $1 = effort level
+	case $1 in
+		low|medium|high|xhigh|max) ;;
+		*) die "invalid effort level: $1 (low, medium, high, xhigh, max)" ;;
+	esac
+	EFFORT=$1
+	LAUNCH=1
+}
+
 # The argument of -c/--claude is optional, so only take the next word when it
 # can only have been meant for claude: option-looking, and none of ours.
 is_claude_args() {
 	case $1 in
-		-h|--help|-c|--claude|-b|--branch|-B|--reset-branch|--checkout\
+		-h|--help|-c|--claude|-e|--effort|--low|--medium|--high|--xhigh|--max\
+		|-b|--branch|-B|--reset-branch|--checkout\
 		|--detach|-f|--force|-D|--dir|--no-exclude|--no-fetch|-p|--path\
 		|--cd|--list|--shell-init|-n|--dry-run|--) return 1 ;;
-		--claude=*|--branch=*|--dir=*|--cd=*|--shell-init=*) return 1 ;;
+		--claude=*|--effort=*|--branch=*|--dir=*|--cd=*|--shell-init=*) return 1 ;;
 		-?*) return 0 ;;
 		*) return 1 ;;
 	esac
@@ -168,6 +187,9 @@ while [ "$#" -gt 0 ]; do
 			fi
 			;;
 		--claude=*)         LAUNCH=1; add_launch_args "${1#*=}" "claude arguments" ;;
+		-e|--effort)        need_arg "$@"; set_effort "$2"; shift ;;
+		--effort=*)         set_effort "${1#*=}" ;;
+		--low|--medium|--high|--xhigh|--max) set_effort "${1#--}" ;;
 		-b|--branch)        need_arg "$@"; BRANCH=$2; shift ;;
 		--branch=*)         BRANCH=${1#*=} ;;
 		-B|--reset-branch)  RESET_BRANCH=1 ;;
@@ -232,7 +254,7 @@ shell_init() {
 		  for __cw_arg in "\$@"; do
 		    # skip the value of options that take one, so \`-b --cd\` is a branch name
 		    case \$__cw_prev in
-		      -b|--branch|-D|--dir) __cw_prev=\$__cw_arg; continue ;;
+		      -b|--branch|-D|--dir|-e|--effort) __cw_prev=\$__cw_arg; continue ;;
 		    esac
 		    case \$__cw_arg in
 		      --) break ;;
@@ -268,10 +290,17 @@ shell_init() {
 			    compadd -a cands
 			    return
 			  fi
+			  if [[ $cur == --effort=* ]]; then
+			    compset -P '--effort='
+			    compadd low medium high xhigh max
+			    return
+			  fi
 			  case $prev in
 			    --cd)
 			      cands=(.. ${(f)"$(__cworktree_names)"})
 			      compadd -a cands; return ;;
+			    -e|--effort)
+			      compadd low medium high xhigh max; return ;;
 			    -b|--branch)
 			      cands=(${(f)"$(git for-each-ref --format='%(refname:short)' refs/heads 2>/dev/null)"})
 			      compadd -a cands; return ;;
@@ -279,7 +308,8 @@ shell_init() {
 			    --shell-init) compadd bash zsh; return ;;
 			  esac
 			  if [[ $cur == -* ]]; then
-			    cands=(-c --claude -b --branch -B --reset-branch --checkout --detach
+			    cands=(-c --claude -e --effort --low --medium --high --xhigh --max
+			           -b --branch -B --reset-branch --checkout --detach
 			           -f --force -D --dir --no-exclude --no-fetch -p --path
 			           --cd --list --shell-init -n --dry-run -h --help)
 			    compadd -a cands; return
@@ -298,7 +328,8 @@ shell_init() {
 			  COMPREPLY=()
 			  cur=${COMP_WORDS[COMP_CWORD]}
 			  prev=${COMP_WORDS[COMP_CWORD-1]}
-			  opts='-c --claude -b --branch -B --reset-branch --checkout --detach
+			  opts='-c --claude -e --effort --low --medium --high --xhigh --max
+			        -b --branch -B --reset-branch --checkout --detach
 			        -f --force -D --dir --no-exclude --no-fetch -p --path
 			        --cd --list --shell-init -n --dry-run -h --help'
 			  case $cur in
@@ -306,11 +337,17 @@ shell_init() {
 			      names=$("$__cworktree_bin" --list 2>/dev/null)
 			      COMPREPLY=( $(compgen -P '--cd=' -W ".. $names" -- "${cur#--cd=}") )
 			      return 0 ;;
+			    --effort=*)
+			      COMPREPLY=( $(compgen -P '--effort=' -W 'low medium high xhigh max' -- "${cur#--effort=}") )
+			      return 0 ;;
 			  esac
 			  case $prev in
 			    --cd)
 			      names=$("$__cworktree_bin" --list 2>/dev/null)
 			      COMPREPLY=( $(compgen -W ".. $names" -- "$cur") )
+			      return 0 ;;
+			    -e|--effort)
+			      COMPREPLY=( $(compgen -W 'low medium high xhigh max' -- "$cur") )
 			      return 0 ;;
 			    -b|--branch)
 			      COMPREPLY=( $(compgen -W "$(git for-each-ref --format='%(refname:short)' refs/heads 2>/dev/null)" -- "$cur") )
@@ -564,6 +601,7 @@ else
 	CMD=(claude)
 	CWD=$WT_PATH
 fi
+[ -z "$EFFORT" ] || CMD+=(--effort "$EFFORT")
 [ "${#LAUNCH_ARGS[@]}" -eq 0 ] || CMD+=("${LAUNCH_ARGS[@]}")
 [ "${#CLAUDE_ARGS[@]}" -eq 0 ] || CMD+=("${CLAUDE_ARGS[@]}")
 

@@ -43,6 +43,8 @@ cworktree fix-login origin/main           # new branch tracking origin/main
 cworktree hotfix v1.2.3 --detach          # detached worktree at tag v1.2.3
 cworktree review --checkout feature/x     # check out an existing branch
 cworktree fix-login --claude              # ... then launch Claude Code in it
+cworktree fix-login --effort high         # ... with a high effort level
+cworktree fix-login --max                 # ... same as --effort max
 cworktree --cd fix-login                  # cd into the worktree
 cworktree --cd ..                         # cd back to the repo root
 cworktree --list                          # list worktrees under the base dir
@@ -63,6 +65,7 @@ given.
 | Option | Meaning |
 | --- | --- |
 | `-c, --claude [args]` | after a successful create, launch Claude Code in the worktree |
+| `-e, --effort <level>` | pass `--effort <level>` to `claude` (`low`, `medium`, `high`, `xhigh`, `max`); implies `-c`. Also as its own flag: `--low`, `--medium`, `--high`, `--xhigh`, `--max` |
 | `-b, --branch <name>` | name for the new branch (default: the worktree name) |
 | `-B, --reset-branch` | reset the branch to the start point if it already exists |
 | `--checkout` | check out the given existing branch instead of creating one |
@@ -87,7 +90,12 @@ Re-running the same command is a no-op if the worktree already exists (with
 claude --worktree <worktree-name> [args]
 ```
 
-No claude flags are hardcoded. Extra arguments come from, in order of precedence:
+No claude flags are hardcoded, apart from `--effort <level>` when you ask for one
+(`-e`/`--effort`, or the shorthands `--low` … `--max`). Asking for an effort level
+implies `-c`, since it is only useful with a session; it is inserted before the
+arguments below, so anything you pass yourself comes later on the command line.
+
+Extra arguments come from, in order of precedence:
 
 1. **`-c '<args>'`** — a single string, parsed like a shell command line, so
    quoting works: `cworktree fix-login -c '--chrome -p "look at the tests"'`.
