@@ -25,7 +25,8 @@ Requires `bash` (3.2+, so the stock macOS bash is fine) and `git` 2.9 or newer.
 
 A child process cannot change its parent's directory, so `--cd` only *prints* a
 path and a small shell wrapper does the `cd`. `--shell-init` emits that wrapper
-plus tab completion:
+plus tab completion (the wrapper is also what makes `--cd -c` cd first and start
+claude afterwards):
 
 ```sh
 # ~/.bashrc
@@ -45,10 +46,19 @@ cworktree review --checkout feature/x     # check out an existing branch
 cworktree fix-login --claude              # ... then launch Claude Code in it
 cworktree fix-login --effort high         # ... with a high effort level
 cworktree fix-login --max                 # ... same as --effort max
-cworktree --cd fix-login                  # cd into the worktree
+cworktree fix-login -c -- fix the login   # ... with a prompt for the session
+cworktree fix-login --cd                  # cd into the worktree
+cworktree fix-login --cd -c               # cd into it, then launch claude there
 cworktree --cd ..                         # cd back to the repo root
-cworktree --list                          # list worktrees under the base dir
+cworktree fix-login -D                    # remove the worktree again
+cworktree -D                              # prune worktrees deleted by hand
+cworktree -l                              # list worktrees + their HEAD commit
 ```
+
+Options may come before or after the worktree name, and `--cd` and `-D`/`--delete`
+take their name from the positional argument when they are not given one
+directly, so `cworktree fix-login --cd` and `cworktree --cd fix-login` mean the
+same thing.
 
 By default a new branch named after the worktree is created from `HEAD`. If the
 start point looks like `<remote>/<branch>` but is unknown, cworktree fetches it
@@ -70,14 +80,19 @@ given.
 | `-B, --reset-branch` | reset the branch to the start point if it already exists |
 | `--checkout` | check out the given existing branch instead of creating one |
 | `--detach` | detached HEAD at the start point, no branch |
-| `-f, --force` | pass `--force` to `git worktree add` |
-| `-D, --dir <path>` | base dir for worktrees, relative to the repo root |
+| `-f, --force` | pass `--force` to `git worktree add`, or to `git worktree remove` with `-D`/`--delete` (twice for a locked worktree) |
+| `-d, --dir <path>` | base dir for worktrees, relative to the repo root |
 | `--no-exclude` | do not touch `.git/info/exclude` |
 | `--no-fetch` | do not auto-fetch when a remote branch is unknown |
 | `-p, --path` | print the worktree path and exit |
 | `-n, --dry-run` | show what would happen, change nothing |
-| `--cd <name>`, `--list`, `--shell-init [sh]` | see above |
-| `--` | everything after this is passed through to `claude` |
+| `--cd [name]` | print the path of an existing worktree so the shell wrapper can cd into it; `--cd ..` is the repo root. With `-c`/`--claude` the shell cds there first and launches claude afterwards |
+| `-D, --delete [name]` | remove the worktree (`git worktree remove`); without a name, prune the bookkeeping of worktrees whose directory is gone (`git worktree prune`) |
+| `-l, --list` | list the worktrees under the base dir, one line each: `git log --oneline -1 --decorate` of that worktree's HEAD, so the decoration reads `(HEAD -> <its own branch>)`. When the listing holds a single worktree it is shown the way git itself would — that same line followed by `git status --short`, run in the worktree, colours included. At a terminal only: piped or captured it prints bare names, one per line, so it stays usable for scripting and tab completion |
+| `--shell-init [sh]` | see above |
+| `--` | everything after this is joined into a single string and passed to `claude` as its `[prompt]`; implies `-c` |
+
+> `-D` used to be the short form of `--dir`, which is now `-d`/`--dir`.
 
 Re-running the same command is a no-op if the worktree already exists (with
 `--claude`, it just starts a new session there).
@@ -103,7 +118,10 @@ Extra arguments come from, in order of precedence:
    is not a cworktree option; for anything else write `--claude='<args>'`.
 2. **`$CWORKTREE_CLAUDE_ARGS`** — your default, used when `-c` is given without
    arguments of its own.
-3. **After `--`** — always appended last: `cworktree fix-login -c -- --resume`.
+3. **After `--`** — everything left is joined with spaces into *one* argument and
+   appended last, which is what `claude` takes as its `[prompt]`:
+   `cworktree fix-login -- look at the failing tests`. Since it is a single
+   argument, put claude *flags* in `-c '<args>'` rather than after `--`.
 
 ```sh
 # ~/.bashrc or ~/.zshrc
@@ -119,7 +137,32 @@ export CWORKTREE_CLAUDE_ARGS='--chrome'
 | Variable | Meaning |
 | --- | --- |
 | `CWORKTREE_CLAUDE_ARGS` | default arguments for `claude` with `-c`/`--claude` |
-| `CWORKTREE_DIR` | default base dir for worktrees (see `-D`/`--dir`) |
+| `CWORKTREE_DIR` | default base dir for worktrees (see `-d`/`--dir`) |
+
+## Navigating and cleaning up
+
+`--cd` prints the path of an existing worktree; with the shell wrapper installed
+your shell moves there. It never creates anything on its own — a typo is an
+error, not a new worktree — but combined with `-c`/`--claude` (which does create
+one when it is missing) the shell cds in first and then starts the session, so
+you are left in the worktree when claude exits:
+
+```sh
+cworktree fix-login --cd -c --high     # create if needed, cd there, then claude
+cworktree --cd ..                      # back to the repo root
+```
+
+`-D`/`--delete` removes a worktree with `git worktree remove`; add `-f` when it
+has uncommitted or untracked files (twice when it is locked). The branch is left
+alone. Without a name it runs `git worktree prune`, which cleans up after
+worktree directories that were deleted by hand:
+
+```sh
+cworktree fix-login -D                 # git worktree remove <path>
+cworktree fix-login -D -f              # ... even when it is dirty
+cworktree -D                           # git worktree prune
+cworktree -D -n                        # show what that would do
+```
 
 ## License
 
