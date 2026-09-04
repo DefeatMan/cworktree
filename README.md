@@ -9,7 +9,10 @@ repository root, so nested worktree trees never appear.
 
 The default layout (`.claude/worktrees/`) is the one Claude Code uses itself, so
 `claude --worktree <name>` reuses the worktree created here instead of creating a
-second one.
+second one. Names with slashes are flattened the same way it flattens them —
+`feat/xy/login` lives in `.claude/worktrees/feat+xy+login`, never in a
+`feat/xy/` subtree — because Claude Code only looks *directly* under that
+directory. The branch keeps its slashes.
 
 ## Install
 
@@ -62,9 +65,21 @@ same thing.
 
 By default a new branch named after the worktree is created from `HEAD`. If the
 start point looks like `<remote>/<branch>` but is unknown, cworktree fetches it
-once before giving up. The worktree path is the only thing printed on stdout
-(everything else goes to stderr), so it composes: `cd "$(cworktree scratch)"`,
-or `cworktree scratch -p` to get the path without creating anything.
+once before giving up.
+
+A worktree name may contain `/`, but the directory it gets is one level deep:
+every `/` becomes a `+`, so `feat/xy/login` is `.claude/worktrees/feat+xy+login`
+with the branch still called `feat/xy/login`. That is exactly what Claude Code
+does with a `--worktree` name, and it is what lets it find this worktree; a
+nested `.claude/worktrees/feat/xy/login` would be invisible to it, and
+`claude --worktree feat/xy/login` would build a second worktree of its own
+alongside. Either spelling addresses the same worktree afterwards, so
+`--cd feat/xy/login` and `--cd feat+xy+login` (the name `--list` prints) both
+work.
+
+The worktree path is the only thing printed on stdout (everything else goes to
+stderr), so it composes: `cd "$(cworktree scratch)"`, or `cworktree scratch -p`
+to get the path without creating anything.
 
 The base directory is added to `.git/info/exclude` (not `.gitignore`, so nothing
 in your repository changes) unless git already ignores it, or `--no-exclude` is
@@ -104,6 +119,15 @@ Re-running the same command is a no-op if the worktree already exists (with
 ```
 claude --worktree <worktree-name> [args]
 ```
+
+The name is the one that resolves to the worktree just created, so the session
+runs in it instead of in a new one: for `feat+xy+login` on disk that is
+`--worktree feat/xy/login`, since Claude Code maps the slashes back to pluses
+itself and rejects a `+` in a name given to it. When it *cannot* be made to
+agree — a base dir other than `.claude/worktrees/`, a name longer than the 64
+characters it accepts, or a worktree still nested by an older cworktree —
+cworktree says so and starts a plain `claude` inside the worktree instead, which
+never creates a second one.
 
 No claude flags are hardcoded, apart from `--effort <level>` when you ask for one
 (`-e`/`--effort`, or the shorthands `--low` … `--max`). Asking for an effort level
@@ -154,7 +178,9 @@ cworktree --cd ..                      # back to the repo root
 
 `-D`/`--delete` removes a worktree with `git worktree remove`; add `-f` when it
 has uncommitted or untracked files (twice when it is locked). The branch is left
-alone. Without a name it runs `git worktree prune`, which cleans up after
+alone. Empty parent directories are cleaned up as well, which is how a worktree
+that an older cworktree nested is migrated: remove it, then create it again to
+get the flat directory Claude Code can reuse. Without a name it runs `git worktree prune`, which cleans up after
 worktree directories that were deleted by hand:
 
 ```sh

@@ -15,8 +15,15 @@ PROG=${0##*/}
 DEFAULT_BASE_DIR=${CWORKTREE_DIR:-.claude/worktrees}
 # Directory layout Claude Code itself uses; when the base dir matches it,
 # `claude --worktree <name>` reuses the worktree created here instead of
-# creating a second one.
+# creating a second one. That only holds while both agree on which directory a
+# name stands for: Claude Code keeps its worktrees *directly* under this
+# directory, turning every '/' in the name into a '+' to get the single
+# directory component, so we flatten names the same way (see wt_dir). A nested
+# .claude/worktrees/feat/xy/x is invisible to it, and `claude --worktree
+# feat/xy/x` would build a second worktree at .claude/worktrees/feat+xy+x.
 CLAUDE_BASE_DIR=.claude/worktrees
+# Longest name `claude --worktree` accepts.
+CLAUDE_NAME_MAX=64
 # Arguments to pass to `claude` when -c/--claude is given without any; nothing
 # is passed by default.
 DEFAULT_CLAUDE_ARGS=${CWORKTREE_CLAUDE_ARGS-}
@@ -48,6 +55,12 @@ Create a git worktree at <repo-root>/$DEFAULT_BASE_DIR/<worktree-name>,
 at the given start point -- a commit, branch, tag or <remote>/<branch>,
 default HEAD. A new branch named after the worktree is created;
 --checkout or --detach change that.
+
+A '/' in the name becomes a '+' in the directory rather than a
+subdirectory -- the same mapping Claude Code applies, so that
+\`claude --worktree feat/xy/x\` reuses our worktree instead of creating
+a second one beside it. Only the directory is flattened; the branch
+keeps its slashes.
 
 Options may come before or after the worktree name. --cd and -D/--delete
 take their name from the positional argument when it is not given to the
@@ -145,6 +158,9 @@ PRINT_PATH=0
 DRY_RUN=0
 CD_TARGET=
 DO_CD=0
+WT_REL=              # worktree directory, relative to the base dir
+WT_ABS=              # ... and absolute; both set by resolve_wt
+CLAUDE_NAME=         # the name `claude --worktree` is given for it
 CD_ONLY=0            # --cd to a worktree that is already there: create nothing
 DO_LIST=0
 DO_DELETE=0
@@ -172,11 +188,39 @@ opt_arg() {          # $1 = option, $2 = next word (if any)
 }
 
 check_name() {       # $1 = worktree name
+	local seg rest
 	case $1 in
-		/*|-*)              die "invalid worktree name: $1" ;;
-		*..*)               die "invalid worktree name: $1" ;;
-		*[!A-Za-z0-9._/-]*) die "invalid worktree name: $1 (allowed: A-Z a-z 0-9 . _ - /)" ;;
+		/*|-*)               die "invalid worktree name: $1" ;;
+		*..*)                die "invalid worktree name: $1" ;;
+		*[!A-Za-z0-9._+/-]*) die "invalid worktree name: $1 (allowed: A-Z a-z 0-9 . _ - + /)" ;;
 	esac
+	# '/' and '+' are one and the same separator once the name is flattened into
+	# a directory name, so both delimit the segments checked here: none may be
+	# empty -- which also rules out a leading, trailing or doubled separator --
+	# and none may name something git owns. What is left is exactly what
+	# `claude --worktree` accepts, so the two never disagree about a name.
+	rest=${1//+//}
+	while :; do
+		seg=${rest%%/*}
+		case $seg in
+			'') die "invalid worktree name: $1 (empty path segment)" ;;
+			.)  die "invalid worktree name: $1 ('.' path segment)" ;;
+			[.][Gg][Ii][Tt]|[.][Gg][Ii][Tt].)
+				die "invalid worktree name: $1 ('$seg' is a reserved git directory name)" ;;
+		esac
+		case $rest in
+			*/*) rest=${rest#*/} ;;
+			*)   break ;;
+		esac
+	done
+}
+
+# The one directory component a worktree name stands for under the base dir.
+# Claude Code makes one out of a `--worktree` name by replacing every '/' with
+# a '+', and looks for worktrees directly under .claude/worktrees/ only, so the
+# same mapping here is what lets it reuse ours instead of creating its own.
+wt_dir() {           # $1 = worktree name
+	printf '%s' "${1//\//+}"
 }
 
 # Print the arguments quoted for a shell to read back, for the launch command
@@ -574,6 +618,20 @@ case $BASE_DIR in /*) die "--dir must be relative to the repo root: $BASE_DIR" ;
 
 # ------------------------------------------- list / delete / --cd / claude ---
 
+# Where the worktree called $1 is, or goes: <base-dir>/<flattened name>, left in
+# WT_REL (relative to the base dir) and WT_ABS.
+resolve_wt() {           # $1 = worktree name
+	local flat
+	flat=$(wt_dir "$1")
+	WT_REL=$flat
+	# --list prints directory names, so one that already is a directory wins over
+	# its flattened form: with a feat+xy+x next to it, spelling out feat/xy/x is
+	# the only way left to reach a feat/xy/x worktree that an older cworktree
+	# nested, whether to cd into it or to remove it.
+	[ "$flat" = "$1" ] || ! worktree_registered "$REPO_ROOT/$BASE_DIR/$1" || WT_REL=$1
+	WT_ABS=$REPO_ROOT/$BASE_DIR/$WT_REL
+}
+
 # Names of the registered worktrees living under <repo-root>/<base-dir>/.
 list_worktree_names() {
 	local prefix=$REPO_ROOT/$BASE_DIR/ key value
@@ -704,6 +762,32 @@ branch_exists() {        # $1 = branch name
 	git show-ref --verify --quiet "refs/heads/$1"
 }
 
+# The name to hand `claude --worktree` for the worktree at WT_REL, left in
+# CLAUDE_NAME. Claude Code flattens '/' to '+' to get the directory, so every
+# name that flattens to WT_REL reaches it -- and as it rejects a '+' in a name
+# of its own, that is WT_REL read back the other way round. Fails, with the
+# reason, whenever Claude Code would instead land somewhere else and build a
+# second worktree there.
+claude_worktree_name() {
+	CLAUDE_NAME=${WT_REL//+//}
+	if [ "$BASE_DIR" != "$CLAUDE_BASE_DIR" ]; then
+		warn "base dir is not $CLAUDE_BASE_DIR; starting claude inside the worktree instead of with --worktree"
+		return 1
+	fi
+	case $WT_REL in
+		*/*)
+			warn "$WT_REL is nested under $BASE_DIR/, where claude --worktree cannot see it; starting claude inside the worktree instead"
+			info "  it predates the flat layout: \`$PROG '$WT_REL' -D\` removes it, then create it again to get one claude can reuse"
+			return 1
+			;;
+	esac
+	if [ "${#CLAUDE_NAME}" -gt "$CLAUDE_NAME_MAX" ]; then
+		warn "the name is longer than the $CLAUDE_NAME_MAX characters claude --worktree accepts; starting claude inside the worktree instead"
+		return 1
+	fi
+	return 0
+}
+
 # Build the claude command line for the worktree at $1 and run it — or, when the
 # shell wrapper has to cd first (--cd together with -c/--claude), print it for
 # the wrapper to evaluate once it has.
@@ -715,13 +799,12 @@ launch_claude() {        # $1 = worktree path, or the repo root for '--cd ..'
 		# '--cd ..': no worktree involved, just a session at the top.
 		CMD=(claude)
 		cwd=$REPO_ROOT
-	elif [ "$BASE_DIR" = "$CLAUDE_BASE_DIR" ]; then
-		# Claude Code looks for worktrees in exactly this directory, so it
+	elif claude_worktree_name; then
+		# Claude Code resolves this name to exactly the worktree we have, so it
 		# reuses the one just created rather than making another.
-		CMD=(claude --worktree "$NAME")
+		CMD=(claude --worktree "$CLAUDE_NAME")
 		cwd=$REPO_ROOT
 	else
-		warn "base dir is not $CLAUDE_BASE_DIR; starting claude inside the worktree instead of with --worktree"
 		CMD=(claude)
 		cwd=$wt_path
 	fi
@@ -765,7 +848,8 @@ if [ "$DO_DELETE" -eq 1 ]; then
 		"${CMD[@]}"
 		exit 0
 	fi
-	DEL_PATH=$REPO_ROOT/$BASE_DIR/$DEL_TARGET
+	resolve_wt "$DEL_TARGET"
+	DEL_PATH=$WT_ABS
 	if ! worktree_registered "$DEL_PATH"; then
 		known_worktrees
 		die "no such worktree: $DEL_TARGET (under $BASE_DIR/)"
@@ -784,13 +868,22 @@ if [ "$DO_DELETE" -eq 1 ]; then
 	[ "$DRY_RUN" -eq 0 ] || exit 0
 	"${CMD[@]}"
 	ok "worktree removed: $DEL_PATH"
+	# `git worktree remove` takes the leaf only, so a name that an older cworktree
+	# nested leaves its parent directories behind empty. Tidy those away as far up
+	# as the base dir; rmdir stops at the first one still holding something.
+	DEL_REL=$WT_REL
+	while [ "${DEL_REL%/*}" != "$DEL_REL" ]; do
+		DEL_REL=${DEL_REL%/*}
+		rmdir "$REPO_ROOT/$BASE_DIR/$DEL_REL" 2>/dev/null || break
+	done
 	exit 0
 fi
 
 # A --cd to a worktree that is already there leaves it alone; one to a worktree
 # that is not only creates it when a create or a session was asked for too.
 if [ "$DO_CD" -eq 1 ] && [ "$CD_ONLY" -eq 0 ]; then
-	if [ -d "$REPO_ROOT/$BASE_DIR/$NAME" ] || [ "$CREATE_INTENT" -eq 0 ]; then
+	resolve_wt "$NAME"
+	if [ -d "$WT_ABS" ] || [ "$CREATE_INTENT" -eq 0 ]; then
 		CD_ONLY=1
 	fi
 fi
@@ -799,7 +892,8 @@ if [ "$CD_ONLY" -eq 1 ]; then
 	case $CD_TARGET in
 		.|..) CD_PATH=$REPO_ROOT ;;
 		*)
-			CD_PATH=$REPO_ROOT/$BASE_DIR/$CD_TARGET
+			resolve_wt "$CD_TARGET"
+			CD_PATH=$WT_ABS
 			if [ ! -d "$CD_PATH" ]; then
 				known_worktrees
 				die "no such worktree: $CD_TARGET (under $BASE_DIR/)"
@@ -814,7 +908,8 @@ if [ "$CD_ONLY" -eq 1 ]; then
 	exit 0
 fi
 
-WT_PATH=$REPO_ROOT/$BASE_DIR/$NAME
+resolve_wt "$NAME"
+WT_PATH=$WT_ABS
 
 if [ "$PRINT_PATH" -eq 1 ]; then
 	printf '%s\n' "$WT_PATH"
