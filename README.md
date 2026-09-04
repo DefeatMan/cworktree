@@ -54,6 +54,7 @@ cworktree fix-login --cd                  # cd into the worktree
 cworktree fix-login --cd -c               # cd into it, then launch claude there
 cworktree --cd ..                         # cd back to the repo root
 cworktree fix-login -D                    # remove the worktree again
+cworktree fix-login review -D             # ... or several worktrees at once
 cworktree -D                              # prune worktrees deleted by hand
 cworktree -l                              # list worktrees + their HEAD commit
 ```
@@ -61,7 +62,8 @@ cworktree -l                              # list worktrees + their HEAD commit
 Options may come before or after the worktree name, and `--cd` and `-D`/`--delete`
 take their name from the positional argument when they are not given one
 directly, so `cworktree fix-login --cd` and `cworktree --cd fix-login` mean the
-same thing.
+same thing. `-D`/`--delete` goes on taking names: every positional argument on
+the line is one more worktree to remove.
 
 By default a new branch named after the worktree is created from `HEAD`. If the
 start point looks like `<remote>/<branch>` but is unknown, cworktree fetches it
@@ -102,7 +104,7 @@ given.
 | `-p, --path` | print the worktree path and exit |
 | `-n, --dry-run` | show what would happen, change nothing |
 | `--cd [name]` | print the path of an existing worktree so the shell wrapper can cd into it; `--cd ..` is the repo root. With `-c`/`--claude` the shell cds there first and launches claude afterwards |
-| `-D, --delete [name]` | remove the worktree (`git worktree remove`); without a name, prune the bookkeeping of worktrees whose directory is gone (`git worktree prune`) |
+| `-D, --delete [name...]` | remove the worktree (`git worktree remove`); several names remove several worktrees; without a name, prune the bookkeeping of worktrees whose directory is gone (`git worktree prune`) |
 | `-l, --list` | list the worktrees under the base dir, one line each: `git log --oneline -1 --decorate` of that worktree's HEAD, so the decoration reads `(HEAD -> <its own branch>)`. When the listing holds a single worktree it is shown the way git itself would — that same line followed by `git status --short`, run in the worktree, colours included. At a terminal only: piped or captured it prints bare names, one per line, so it stays usable for scripting and tab completion |
 | `--shell-init [sh]` | see above |
 | `--` | everything after this is joined into a single string and passed to `claude` as its `[prompt]`; implies `-c` |
@@ -188,6 +190,21 @@ cworktree fix-login -D                 # git worktree remove <path>
 cworktree fix-login -D -f              # ... even when it is dirty
 cworktree -D                           # git worktree prune
 cworktree -D -n                        # show what that would do
+```
+
+Any number of names may be given, in either order — `cworktree a b c -D` and
+`cworktree -D a b c` are the same list. Nothing is removed until every name has
+resolved to a registered worktree, so a typo at the end of the list cannot take
+the beginning of it with it, and the same worktree named twice is removed once.
+After that the list is worked through to the end: one worktree that refuses to
+go — dirty, or locked — leaves the others removed and only shows up in the exit
+status.
+
+```sh
+cworktree a b c -D                     # remove three worktrees
+cworktree -D a b c                     # ... the same list
+cworktree -D a b c -f                  # ... even the dirty ones
+cworktree -D a b c -n                  # show what that would do
 ```
 
 ## License

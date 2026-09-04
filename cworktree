@@ -47,7 +47,7 @@ usage() {
 	cat <<EOF
 Usage: $PROG [options] <worktree-name> [start-point]
        $PROG <worktree-name>|.. --cd [-c]
-       $PROG [<worktree-name>] -D|--delete [-f]
+       $PROG [<worktree-name>...] -D|--delete [-f]
        $PROG -l|--list
        $PROG --shell-init [bash|zsh]
 
@@ -65,7 +65,8 @@ keeps its slashes.
 Options may come before or after the worktree name. --cd and -D/--delete
 take their name from the positional argument when it is not given to the
 option itself, so \`$PROG fix-login --cd\` and \`$PROG --cd fix-login\`
-mean the same thing.
+mean the same thing. -D/--delete goes on taking names: every positional
+argument on the line is one more worktree to remove.
 
 Worktree:
   -b, --branch <name>   name for the new branch (default: the worktree name)
@@ -100,9 +101,13 @@ Navigation and cleanup:
                         wrapper to cd into; '..' is the repo root. With
                         -c/--claude the shell cds there first and launches
                         claude afterwards
-  -D, --delete [name]   \`git worktree remove\` the worktree; -f if it is
-                        dirty, -ff if it is locked. Without a name,
-                        \`git worktree prune\` instead
+  -D, --delete [name...]
+                        \`git worktree remove\` the worktree; -f if it is
+                        dirty, -ff if it is locked. Several names remove
+                        several worktrees: none goes until they all
+                        resolve, and one that refuses does not stop the
+                        others. Without a name, \`git worktree prune\`
+                        instead
   -l, --list            list the worktrees under the base dir, one line each:
                         \`git log --oneline -1 --decorate\` of that worktree's
                         HEAD. A single worktree is shown as git itself would,
@@ -138,6 +143,7 @@ Examples:
   $PROG fix-login --cd -c             # cd there, then claude
   $PROG --cd ..                       # cd back to the repo root
   $PROG fix-login -D                  # remove the worktree
+  $PROG fix-login review -D           # ... or several at once
   $PROG -D                            # prune deleted worktrees
 EOF
 }
@@ -164,7 +170,9 @@ CLAUDE_NAME=         # the name `claude --worktree` is given for it
 CD_ONLY=0            # --cd to a worktree that is already there: create nothing
 DO_LIST=0
 DO_DELETE=0
-DEL_TARGET=
+DEL_TARGET=           # name given to -D/--delete itself
+DEL_TARGETS=()        # every worktree -D/--delete was asked to remove
+POS=()                # positional arguments, in order
 SHELL_INIT=
 EFFORT=              # claude --effort <level>
 LAUNCH_ARGS=()       # from -c/--claude, or $CWORKTREE_CLAUDE_ARGS
@@ -317,18 +325,22 @@ while [ "$#" -gt 0 ]; do
 			break
 			;;
 		-*)                 die "unknown option: $1 (try --help)" ;;
-		*)
-			if [ -z "$NAME" ]; then
-				NAME=$1
-			elif [ -z "$START_POINT" ]; then
-				START_POINT=$1
-			else
-				die "unexpected argument: $1 (try --help)"
-			fi
-			;;
+		*)                  POS+=("$1") ;;
 	esac
 	shift
 done
+
+# What the positional arguments mean depends on the mode, so they are only
+# sorted out once the whole line has been read: -D/--delete takes any number of
+# worktree names, everything else a name and a start point.
+if [ "$DO_DELETE" -eq 1 ]; then
+	[ -z "$DEL_TARGET" ] || DEL_TARGETS=("$DEL_TARGET")
+	[ "${#POS[@]}" -eq 0 ] || DEL_TARGETS+=("${POS[@]}")
+else
+	[ "${#POS[@]}" -le 2 ] || die "unexpected argument: ${POS[2]} (try --help)"
+	NAME=${POS[0]-}
+	START_POINT=${POS[1]-}
+fi
 
 # -c/--claude without arguments of its own falls back to the environment.
 if [ "$LAUNCH" -eq 1 ] && [ "$LAUNCH_ARGS_SET" -eq 0 ]; then
@@ -426,6 +438,12 @@ shell_init() {
 			_cworktree() {
 			  local cur=${words[CURRENT]} prev=${words[CURRENT-1]}
 			  local -a cands
+			  # -D/--delete takes any number of names, so once it is on the line
+			  # every positional completes to a worktree rather than to a branch.
+			  local i del=0
+			  for (( i = 1; i < CURRENT; i++ )); do
+			    case ${words[i]} in -D|--delete|--delete=*) del=1 ;; esac
+			  done
 			  if [[ $cur == --cd=* ]]; then
 			    compset -P '--cd='
 			    cands=(.. ${(f)"$(__cworktree_names)"})
@@ -447,9 +465,6 @@ shell_init() {
 			    --cd)
 			      cands=(.. ${(f)"$(__cworktree_names)"})
 			      compadd -a cands; return ;;
-			    -D|--delete)
-			      cands=(${(f)"$(__cworktree_names)"})
-			      compadd -a cands; return ;;
 			    -e|--effort)
 			      compadd low medium high xhigh max; return ;;
 			    -b|--branch)
@@ -465,6 +480,10 @@ shell_init() {
 			           --cd -D --delete -l --list --shell-init -n --dry-run -h --help)
 			    compadd -a cands; return
 			  fi
+			  if (( del )); then
+			    cands=(${(f)"$(__cworktree_names)"})
+			    compadd -a cands; return
+			  fi
 			  cands=(${(f)"$(git for-each-ref --format='%(refname:short)' refs/heads refs/remotes refs/tags 2>/dev/null)"})
 			  compadd -a cands
 			}
@@ -475,10 +494,15 @@ shell_init() {
 		cat <<-'EOF'
 
 			_cworktree() {
-			  local cur prev names opts
+			  local cur prev names opts i del=0
 			  COMPREPLY=()
 			  cur=${COMP_WORDS[COMP_CWORD]}
 			  prev=${COMP_WORDS[COMP_CWORD-1]}
+			  # -D/--delete takes any number of names, so once it is on the line
+			  # every positional completes to a worktree rather than to a branch.
+			  for (( i = 1; i < COMP_CWORD; i++ )); do
+			    case ${COMP_WORDS[i]} in -D|--delete|--delete=*) del=1 ;; esac
+			  done
 			  opts='-c --claude -e --effort --low --medium --high --xhigh --max
 			        -b --branch -B --reset-branch --checkout --detach
 			        -f --force -d --dir --no-exclude --no-fetch -p --path
@@ -501,10 +525,6 @@ shell_init() {
 			      names=$("$__cworktree_bin" --list 2>/dev/null)
 			      COMPREPLY=( $(compgen -W ".. $names" -- "$cur") )
 			      return 0 ;;
-			    -D|--delete)
-			      names=$("$__cworktree_bin" --list 2>/dev/null)
-			      COMPREPLY=( $(compgen -W "$names" -- "$cur") )
-			      return 0 ;;
 			    -e|--effort)
 			      COMPREPLY=( $(compgen -W 'low medium high xhigh max' -- "$cur") )
 			      return 0 ;;
@@ -520,6 +540,11 @@ shell_init() {
 			  esac
 			  if [[ $cur == -* ]]; then
 			    COMPREPLY=( $(compgen -W "$opts" -- "$cur") )
+			    return 0
+			  fi
+			  if [ "$del" -eq 1 ]; then
+			    names=$("$__cworktree_bin" --list 2>/dev/null)
+			    COMPREPLY=( $(compgen -W "$names" -- "$cur") )
 			    return 0
 			  fi
 			  COMPREPLY=( $(compgen -W "$(git for-each-ref --format='%(refname:short)' refs/heads refs/remotes refs/tags 2>/dev/null)" -- "$cur") )
@@ -586,13 +611,11 @@ if [ "$DO_CD" -eq 1 ]; then
 fi
 
 if [ "$DO_DELETE" -eq 1 ]; then
-	if [ -z "$DEL_TARGET" ]; then
-		DEL_TARGET=$NAME
-	elif [ -n "$NAME" ] && [ "$NAME" != "$DEL_TARGET" ]; then
-		die "conflicting worktree names: $DEL_TARGET and $NAME"
+	if [ "${#DEL_TARGETS[@]}" -gt 0 ]; then
+		for del_name in "${DEL_TARGETS[@]}"; do
+			check_name "$del_name"
+		done
 	fi
-	[ -z "$START_POINT" ] || die "unexpected argument: $START_POINT (try --help)"
-	[ -z "$DEL_TARGET" ] || check_name "$DEL_TARGET"
 elif [ "$DO_LIST" -eq 1 ]; then
 	[ -z "$NAME" ] || die "unexpected argument: $NAME (--list takes none)"
 elif [ "$CD_ONLY" -eq 0 ]; then
@@ -840,7 +863,7 @@ if [ "$DO_LIST" -eq 1 ]; then
 fi
 
 if [ "$DO_DELETE" -eq 1 ]; then
-	if [ -z "$DEL_TARGET" ]; then
+	if [ "${#DEL_TARGETS[@]}" -eq 0 ]; then
 		# No name: only clean up after worktrees whose directory is gone.
 		CMD=(git -C "$REPO_ROOT" worktree prune --verbose)
 		[ "$DRY_RUN" -eq 0 ] || CMD+=(--dry-run)
@@ -848,34 +871,63 @@ if [ "$DO_DELETE" -eq 1 ]; then
 		"${CMD[@]}"
 		exit 0
 	fi
-	resolve_wt "$DEL_TARGET"
-	DEL_PATH=$WT_ABS
-	if ! worktree_registered "$DEL_PATH"; then
-		known_worktrees
-		die "no such worktree: $DEL_TARGET (under $BASE_DIR/)"
-	fi
-	# git refuses to remove the worktree it runs in; catch the same mistake
-	# early, whatever directory git itself is invoked from.
-	case $PWD/ in
-		"$DEL_PATH"/*) die "you are inside $DEL_TARGET; cd out of it first (e.g. \`$PROG --cd ..\`)" ;;
-	esac
-	CMD=(git -C "$REPO_ROOT" worktree remove)
-	# One --force removes a dirty worktree, a second one a locked worktree.
-	[ "$FORCE" -lt 1 ] || CMD+=(--force)
-	[ "$FORCE" -lt 2 ] || CMD+=(--force)
-	CMD+=("$DEL_PATH")
-	info "+ ${CMD[*]}"
-	[ "$DRY_RUN" -eq 0 ] || exit 0
-	"${CMD[@]}"
-	ok "worktree removed: $DEL_PATH"
-	# `git worktree remove` takes the leaf only, so a name that an older cworktree
-	# nested leaves its parent directories behind empty. Tidy those away as far up
-	# as the base dir; rmdir stops at the first one still holding something.
-	DEL_REL=$WT_REL
-	while [ "${DEL_REL%/*}" != "$DEL_REL" ]; do
-		DEL_REL=${DEL_REL%/*}
-		rmdir "$REPO_ROOT/$BASE_DIR/$DEL_REL" 2>/dev/null || break
+	# Every name is resolved and vetted before the first worktree goes, so a typo
+	# at the end of the list does not remove the beginning of it first.
+	DEL_PATHS=()
+	DEL_RELS=()
+	for del_name in "${DEL_TARGETS[@]}"; do
+		resolve_wt "$del_name"
+		if ! worktree_registered "$WT_ABS"; then
+			known_worktrees
+			die "no such worktree: $del_name (under $BASE_DIR/)"
+		fi
+		# git refuses to remove the worktree it runs in; catch the same mistake
+		# early, whatever directory git itself is invoked from.
+		case $PWD/ in
+			"$WT_ABS"/*) die "you are inside $del_name; cd out of it first (e.g. \`$PROG --cd ..\`)" ;;
+		esac
+		# One worktree named twice -- or once by name and once already flattened --
+		# is removed once; the second `git worktree remove` would only fail.
+		del_dup=0
+		for del_seen in ${DEL_PATHS[@]+"${DEL_PATHS[@]}"}; do
+			[ "$del_seen" != "$WT_ABS" ] || { del_dup=1; break; }
+		done
+		if [ "$del_dup" -eq 0 ]; then
+			DEL_PATHS+=("$WT_ABS")
+			DEL_RELS+=("$WT_REL")
+		fi
 	done
+	DEL_FAILED=0
+	del_i=0
+	while [ "$del_i" -lt "${#DEL_PATHS[@]}" ]; do
+		DEL_PATH=${DEL_PATHS[$del_i]}
+		DEL_REL=${DEL_RELS[$del_i]}
+		del_i=$((del_i + 1))
+		CMD=(git -C "$REPO_ROOT" worktree remove)
+		# One --force removes a dirty worktree, a second one a locked worktree.
+		[ "$FORCE" -lt 1 ] || CMD+=(--force)
+		[ "$FORCE" -lt 2 ] || CMD+=(--force)
+		CMD+=("$DEL_PATH")
+		info "+ ${CMD[*]}"
+		[ "$DRY_RUN" -eq 0 ] || continue
+		# One worktree refusing to go -- dirty, locked -- does not hold up the
+		# rest of the list; the exit status still reports it.
+		if ! "${CMD[@]}"; then
+			DEL_FAILED=$((DEL_FAILED + 1))
+			continue
+		fi
+		ok "worktree removed: $DEL_PATH"
+		# `git worktree remove` takes the leaf only, so a name that an older
+		# cworktree nested leaves its parent directories behind empty. Tidy those
+		# away as far up as the base dir; rmdir stops at the first one still
+		# holding something.
+		while [ "${DEL_REL%/*}" != "$DEL_REL" ]; do
+			DEL_REL=${DEL_REL%/*}
+			rmdir "$REPO_ROOT/$BASE_DIR/$DEL_REL" 2>/dev/null || break
+		done
+	done
+	[ "$DEL_FAILED" -eq 0 ] ||
+		die "$DEL_FAILED of ${#DEL_PATHS[@]} worktrees could not be removed"
 	exit 0
 fi
 
