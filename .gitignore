@@ -1,3 +1,5 @@
 .claude/settings.local.json
 .claude/worktrees/
+.agents/
+.claude/
 .DS_Store

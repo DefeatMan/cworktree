@@ -45,7 +45,7 @@ eval "$(cworktree --shell-init zsh)"
 cworktree fix-login                       # new branch fix-login from HEAD
 cworktree fix-login origin/main           # new branch tracking origin/main
 cworktree hotfix v1.2.3 --detach          # detached worktree at tag v1.2.3
-cworktree review --checkout feature/x     # check out an existing branch
+cworktree --checkout feature/x            # attach an existing branch
 cworktree fix-login --claude              # ... then launch Claude Code in it
 cworktree fix-login --effort high         # ... with a high effort level
 cworktree fix-login --max                 # ... same as --effort max
@@ -59,21 +59,26 @@ cworktree -D                              # prune worktrees deleted by hand
 cworktree -l                              # list worktrees + their HEAD commit
 ```
 
-Options may come before or after the worktree name, and `--cd` and `-D`/`--delete`
-take their name from the positional argument when they are not given one
-directly, so `cworktree fix-login --cd` and `cworktree --cd fix-login` mean the
-same thing. `-D`/`--delete` goes on taking names: every positional argument on
-the line is one more worktree to remove.
+Options may come before or after the branch name, and `--cd`, `-D`/`--delete`
+and `--checkout` take their name from the positional argument when they are
+not given one directly, so `cworktree fix-login --cd` and `cworktree --cd
+fix-login` mean the same thing — likewise `cworktree --checkout feature/x` and
+`cworktree feature/x --checkout`. `-D`/`--delete` goes on taking names: every
+positional argument on the line is one more worktree to remove.
 
-By default a new branch named after the worktree is created from `HEAD`. If the
-start point looks like `<remote>/<branch>` but is unknown, cworktree fetches it
-once before giving up.
+A worktree's name is always its branch's — the two are never configured
+apart. By default a new branch is created from `HEAD`; if the base branch
+looks like `<remote>/<branch>` but is unknown, cworktree fetches it once
+before giving up. `--checkout` attaches an existing branch instead of
+creating one; `--detach` checks out a commit with no branch at all, so the
+worktree's name is then just a name of its own.
 
-A worktree name may contain `/`, but the directory it gets is one level deep:
-every `/` becomes a `+`, so `feat/xy/login` is `.claude/worktrees/feat+xy+login`
-with the branch still called `feat/xy/login`. That is exactly what Claude Code
-does with a `--worktree` name, and it is what lets it find this worktree; a
-nested `.claude/worktrees/feat/xy/login` would be invisible to it, and
+A branch name may contain `/`, but the worktree directory it gets is one
+level deep: every `/` becomes a `+`, so `feat/xy/login` is
+`.claude/worktrees/feat+xy+login` with the branch still called
+`feat/xy/login`. That is exactly what Claude Code does with a `--worktree`
+name, and it is what lets it find this worktree; a nested
+`.claude/worktrees/feat/xy/login` would be invisible to it, and
 `claude --worktree feat/xy/login` would build a second worktree of its own
 alongside. Either spelling addresses the same worktree afterwards, so
 `--cd feat/xy/login` and `--cd feat+xy+login` (the name `--list` prints) both
@@ -93,9 +98,8 @@ given.
 | --- | --- |
 | `-c, --claude [args]` | after a successful create, launch Claude Code in the worktree |
 | `-e, --effort <level>` | pass `--effort <level>` to `claude` (`low`, `medium`, `high`, `xhigh`, `max`); implies `-c`. Also as its own flag: `--low`, `--medium`, `--high`, `--xhigh`, `--max` |
-| `-b, --branch <name>` | name for the new branch (default: the worktree name) |
-| `-B, --reset-branch` | reset the branch to the start point if it already exists |
-| `--checkout` | check out the given existing branch instead of creating one |
+| `-B, --reset-branch` | reset the branch to the base branch if it already exists |
+| `--checkout <name>` | attach an existing branch instead of creating one; the worktree is named after it, exactly like a new branch |
 | `--detach` | detached HEAD at the start point, no branch |
 | `-f, --force` | pass `--force` to `git worktree add`, or to `git worktree remove` with `-D`/`--delete` (twice for a locked worktree) |
 | `-d, --dir <path>` | base dir for worktrees, relative to the repo root |
@@ -110,6 +114,8 @@ given.
 | `--` | everything after this is joined into a single string and passed to `claude` as its `[prompt]`; implies `-c` |
 
 > `-D` used to be the short form of `--dir`, which is now `-d`/`--dir`.
+> `-b`/`--branch` has been removed: a worktree is always named after its
+> branch, so there is no longer a separate name to give it.
 
 Re-running the same command is a no-op if the worktree already exists (with
 `--claude`, it just starts a new session there).
@@ -119,22 +125,29 @@ Re-running the same command is a no-op if the worktree already exists (with
 `-c`/`--claude` runs, in the current terminal:
 
 ```
-claude --worktree <worktree-name> [args]
+claude --worktree <name> --name <name> [args]
 ```
 
 The name is the one that resolves to the worktree just created, so the session
 runs in it instead of in a new one: for `feat+xy+login` on disk that is
 `--worktree feat/xy/login`, since Claude Code maps the slashes back to pluses
-itself and rejects a `+` in a name given to it. When it *cannot* be made to
-agree — a base dir other than `.claude/worktrees/`, a name longer than the 64
-characters it accepts, or a worktree still nested by an older cworktree —
-cworktree says so and starts a plain `claude` inside the worktree instead, which
-never creates a second one.
+itself and rejects a `+` in a name given to it. The same name is passed to
+`--name`, which sets the session's display name: an *unnamed* `--worktree`
+session is one Claude Code deletes on a clean exit — worktree and branch both
+— so naming it turns that into a prompt instead, and lets `claude --resume
+<name>` find the same worktree again later. When the worktree's name *cannot*
+be made to agree with what `claude --worktree` accepts — a base dir other than
+`.claude/worktrees/`, a name longer than the 64 characters it allows, or a
+worktree still nested by an older cworktree — cworktree says so and starts a
+plain `claude` inside the worktree instead, with neither flag: Claude Code
+never created that worktree, so it never auto-deletes it either.
 
-No claude flags are hardcoded, apart from `--effort <level>` when you ask for one
-(`-e`/`--effort`, or the shorthands `--low` … `--max`). Asking for an effort level
-implies `-c`, since it is only useful with a session; it is inserted before the
-arguments below, so anything you pass yourself comes later on the command line.
+No claude flags are hardcoded, apart from `--worktree`/`--name` and
+`--effort <level>` when you ask for one (`-e`/`--effort`, or the shorthands
+`--low` … `--max`). Asking for an effort level implies `-c`, since it is only
+useful with a session; it is inserted before the arguments below, so anything
+you pass yourself comes later on the command line — including your own
+`--name`, if you would rather override the default.
 
 Extra arguments come from, in order of precedence:
 

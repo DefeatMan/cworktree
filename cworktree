@@ -45,16 +45,20 @@ ok()   { printf '%s%s%s\n' "$C_GRN" "$*" "$C_OFF" >&2; }
 
 usage() {
 	cat <<EOF
-Usage: $PROG [options] <worktree-name> [start-point]
-       $PROG <worktree-name>|.. --cd [-c]
-       $PROG [<worktree-name>...] -D|--delete [-f]
+Usage: $PROG [options] <new-branch-name> [<base-branch-name>|HEAD]
+       $PROG --checkout <attached-branch-name> [options]
+       $PROG <name>|.. --cd [-c]
+       $PROG [<name>...] -D|--delete [-f]
        $PROG -l|--list
        $PROG --shell-init [bash|zsh]
 
-Create a git worktree at <repo-root>/$DEFAULT_BASE_DIR/<worktree-name>,
-at the given start point -- a commit, branch, tag or <remote>/<branch>,
-default HEAD. A new branch named after the worktree is created;
---checkout or --detach change that.
+Create a git worktree at <repo-root>/$DEFAULT_BASE_DIR/<new-branch-name>,
+with a new branch of that same name, from the given base branch -- a
+commit, branch, tag or <remote>/<branch>, default HEAD. A worktree's
+name is always its branch's; the two are never configured apart.
+--checkout attaches an existing branch instead of creating one, named
+the same way; --detach checks out a commit with no branch at all, so
+the worktree's name is then just a name of its own.
 
 A '/' in the name becomes a '+' in the directory rather than a
 subdirectory -- the same mapping Claude Code applies, so that
@@ -62,16 +66,17 @@ subdirectory -- the same mapping Claude Code applies, so that
 a second one beside it. Only the directory is flattened; the branch
 keeps its slashes.
 
-Options may come before or after the worktree name. --cd and -D/--delete
-take their name from the positional argument when it is not given to the
-option itself, so \`$PROG fix-login --cd\` and \`$PROG --cd fix-login\`
-mean the same thing. -D/--delete goes on taking names: every positional
-argument on the line is one more worktree to remove.
+Options may come before or after the branch name. --cd, -D/--delete and
+--checkout take their name from the positional argument when it is not
+given to the option itself, so \`$PROG fix-login --cd\` and
+\`$PROG --cd fix-login\` mean the same thing -- likewise
+\`$PROG --checkout feature/x\` and \`$PROG feature/x --checkout\`.
+-D/--delete goes on taking names: every positional argument on the line
+is one more worktree to remove.
 
 Worktree:
-  -b, --branch <name>   name for the new branch (default: the worktree name)
-  -B, --reset-branch    reset the branch to the start point if it exists
-      --checkout        check out the given existing branch, create none
+  -B, --reset-branch    reset the branch to the base branch if it exists
+      --checkout <name> attach an existing branch, create no new one
       --detach          detached HEAD at the start point, no branch
   -d, --dir <path>      base dir for worktrees, relative to the repo root
                         (default: $DEFAULT_BASE_DIR, env: CWORKTREE_DIR)
@@ -82,9 +87,12 @@ Worktree:
 
 Claude Code:
   -c, --claude [args]   after a successful create, run in this terminal:
-                          claude --worktree <worktree-name> [args]
-                        [args] is one string of extra claude arguments,
-                        parsed like a shell command line, e.g.
+                          claude --worktree <name> --name <name> [args]
+                        naming the session after the worktree keeps
+                        Claude Code from deleting it on a clean exit,
+                        which is what an unnamed --worktree session does
+                        by default. [args] is one string of extra claude
+                        arguments, parsed like a shell command line, e.g.
                           -c '--chrome --dangerously-skip-permissions'
                         It is only taken as such when it starts with '-'
                         and is not a $PROG option; otherwise write
@@ -135,7 +143,7 @@ Examples:
   $PROG fix-login                     # new branch from HEAD
   $PROG fix-login origin/main         # ... tracking origin/main
   $PROG hotfix v1.2.3 --detach        # detached at tag v1.2.3
-  $PROG review --checkout feature/x   # an existing branch
+  $PROG --checkout feature/x          # attach an existing branch
   $PROG fix-login -c '--chrome'       # claude, with --chrome
   $PROG fix-login --max               # claude at max effort
   $PROG fix-login -c -- fix the login # ... with a prompt
@@ -152,7 +160,7 @@ EOF
 
 NAME=
 START_POINT=
-BRANCH=
+CHECKOUT_TARGET=      # branch given directly to --checkout, see opt_arg
 BASE_DIR=$DEFAULT_BASE_DIR
 MODE=new            # new | checkout | detach
 LAUNCH=0
@@ -183,9 +191,9 @@ OPT_ARG=             # last optional option argument, see opt_arg
 
 need_arg() { [ "$#" -ge 2 ] || die "option $1 requires an argument"; }
 
-# Options whose argument may instead be given as the positional worktree name
-# (--cd, -D/--delete) only take the next word when it cannot be an option of
-# ours; the result is left in OPT_ARG.
+# Options whose argument may instead be given as the positional name (--cd,
+# -D/--delete, --checkout) only take the next word when it cannot be an
+# option of ours; the result is left in OPT_ARG.
 opt_arg() {          # $1 = option, $2 = next word (if any)
 	OPT_ARG=
 	[ "$#" -ge 2 ] || return 1
@@ -275,10 +283,10 @@ set_effort() {       # $1 = effort level
 is_claude_args() {
 	case $1 in
 		-h|--help|-c|--claude|-e|--effort|--low|--medium|--high|--xhigh|--max\
-		|-b|--branch|-B|--reset-branch|--checkout\
+		|-B|--reset-branch|--checkout\
 		|--detach|-f|--force|-d|--dir|--no-exclude|--no-fetch|-p|--path\
 		|--cd|-D|--delete|-l|--list|--shell-init|-n|--dry-run|--) return 1 ;;
-		--claude=*|--effort=*|--branch=*|--dir=*|--cd=*|--delete=*|--shell-init=*) return 1 ;;
+		--claude=*|--effort=*|--checkout=*|--dir=*|--cd=*|--delete=*|--shell-init=*) return 1 ;;
 		-?*) return 0 ;;
 		*) return 1 ;;
 	esac
@@ -297,10 +305,9 @@ while [ "$#" -gt 0 ]; do
 		-e|--effort)        need_arg "$@"; set_effort "$2"; shift ;;
 		--effort=*)         set_effort "${1#*=}" ;;
 		--low|--medium|--high|--xhigh|--max) set_effort "${1#--}" ;;
-		-b|--branch)        need_arg "$@"; BRANCH=$2; shift ;;
-		--branch=*)         BRANCH=${1#*=} ;;
 		-B|--reset-branch)  RESET_BRANCH=1 ;;
-		--checkout)         MODE=checkout ;;
+		--checkout)         MODE=checkout; if opt_arg "$@"; then CHECKOUT_TARGET=$OPT_ARG; shift; fi ;;
+		--checkout=*)       MODE=checkout; CHECKOUT_TARGET=${1#*=} ;;
 		--detach)           MODE=detach ;;
 		-f|--force)         FORCE=$((FORCE + 1)) ;;
 		-d|--dir)           need_arg "$@"; BASE_DIR=$2; shift ;;
@@ -331,11 +338,21 @@ while [ "$#" -gt 0 ]; do
 done
 
 # What the positional arguments mean depends on the mode, so they are only
-# sorted out once the whole line has been read: -D/--delete takes any number of
-# worktree names, everything else a name and a start point.
+# sorted out once the whole line has been read: -D/--delete takes any number
+# of worktree names; --checkout takes the one branch to attach, from its own
+# argument or the sole positional; everything else a new branch name and a
+# base branch.
 if [ "$DO_DELETE" -eq 1 ]; then
 	[ -z "$DEL_TARGET" ] || DEL_TARGETS=("$DEL_TARGET")
 	[ "${#POS[@]}" -eq 0 ] || DEL_TARGETS+=("${POS[@]}")
+elif [ "$MODE" = checkout ]; then
+	[ "${#POS[@]}" -le 1 ] || die "unexpected argument: ${POS[1]} (try --help)"
+	NAME=${POS[0]-}
+	if [ -n "$CHECKOUT_TARGET" ]; then
+		[ -z "$NAME" ] || [ "$NAME" = "$CHECKOUT_TARGET" ] ||
+			die "conflicting branch names: $CHECKOUT_TARGET and $NAME"
+		NAME=$CHECKOUT_TARGET
+	fi
 else
 	[ "${#POS[@]}" -le 2 ] || die "unexpected argument: ${POS[2]} (try --help)"
 	NAME=${POS[0]-}
@@ -359,7 +376,7 @@ fi
 # a worktree behind); asking for a session, or for anything about the branch,
 # means the worktree may be created on the way.
 CREATE_INTENT=0
-if [ "$LAUNCH" -eq 1 ] || [ -n "$START_POINT" ] || [ -n "$BRANCH" ] \
+if [ "$LAUNCH" -eq 1 ] || [ -n "$START_POINT" ] \
 	|| [ "$MODE" != new ] || [ "$RESET_BRANCH" -eq 1 ]; then
 	CREATE_INTENT=1
 fi
@@ -387,9 +404,9 @@ shell_init() {
 		cworktree() {
 		  local __cw_arg __cw_prev= __cw_cd=0 __cw_run=0 __cw_out __cw_last __cw_cmd=
 		  for __cw_arg in "\$@"; do
-		    # skip the value of options that take one, so \`-b --cd\` is a branch name
+		    # skip the value of options that take one, so \`-d --cd\` is a directory named --cd
 		    case \$__cw_prev in
-		      -b|--branch|-d|--dir|-e|--effort) __cw_prev=\$__cw_arg; continue ;;
+		      -d|--dir|-e|--effort) __cw_prev=\$__cw_arg; continue ;;
 		    esac
 		    case \$__cw_arg in
 		      --) __cw_run=1; break ;;
@@ -461,13 +478,19 @@ shell_init() {
 			    compadd low medium high xhigh max
 			    return
 			  fi
+			  if [[ $cur == --checkout=* ]]; then
+			    compset -P '--checkout='
+			    cands=(${(f)"$(git for-each-ref --format='%(refname:short)' refs/heads 2>/dev/null)"})
+			    compadd -a cands
+			    return
+			  fi
 			  case $prev in
 			    --cd)
 			      cands=(.. ${(f)"$(__cworktree_names)"})
 			      compadd -a cands; return ;;
 			    -e|--effort)
 			      compadd low medium high xhigh max; return ;;
-			    -b|--branch)
+			    --checkout)
 			      cands=(${(f)"$(git for-each-ref --format='%(refname:short)' refs/heads 2>/dev/null)"})
 			      compadd -a cands; return ;;
 			    -d|--dir)   _files -/; return ;;
@@ -475,7 +498,7 @@ shell_init() {
 			  esac
 			  if [[ $cur == -* ]]; then
 			    cands=(-c --claude -e --effort --low --medium --high --xhigh --max
-			           -b --branch -B --reset-branch --checkout --detach
+			           -B --reset-branch --checkout --detach
 			           -f --force -d --dir --no-exclude --no-fetch -p --path
 			           --cd -D --delete -l --list --shell-init -n --dry-run -h --help)
 			    compadd -a cands; return
@@ -504,7 +527,7 @@ shell_init() {
 			    case ${COMP_WORDS[i]} in -D|--delete|--delete=*) del=1 ;; esac
 			  done
 			  opts='-c --claude -e --effort --low --medium --high --xhigh --max
-			        -b --branch -B --reset-branch --checkout --detach
+			        -B --reset-branch --checkout --detach
 			        -f --force -d --dir --no-exclude --no-fetch -p --path
 			        --cd -D --delete -l --list --shell-init -n --dry-run -h --help'
 			  case $cur in
@@ -519,6 +542,9 @@ shell_init() {
 			    --effort=*)
 			      COMPREPLY=( $(compgen -P '--effort=' -W 'low medium high xhigh max' -- "${cur#--effort=}") )
 			      return 0 ;;
+			    --checkout=*)
+			      COMPREPLY=( $(compgen -P '--checkout=' -W "$(git for-each-ref --format='%(refname:short)' refs/heads 2>/dev/null)" -- "${cur#--checkout=}") )
+			      return 0 ;;
 			  esac
 			  case $prev in
 			    --cd)
@@ -528,7 +554,7 @@ shell_init() {
 			    -e|--effort)
 			      COMPREPLY=( $(compgen -W 'low medium high xhigh max' -- "$cur") )
 			      return 0 ;;
-			    -b|--branch)
+			    --checkout)
 			      COMPREPLY=( $(compgen -W "$(git for-each-ref --format='%(refname:short)' refs/heads 2>/dev/null)" -- "$cur") )
 			      return 0 ;;
 			    -d|--dir)
@@ -620,8 +646,6 @@ elif [ "$DO_LIST" -eq 1 ]; then
 	[ -z "$NAME" ] || die "unexpected argument: $NAME (--list takes none)"
 elif [ "$CD_ONLY" -eq 0 ]; then
 	[ -n "$NAME" ] || { usage >&2; exit 2; }
-	[ "$MODE" != detach ] || [ -z "$BRANCH" ] || die "--detach and --branch are mutually exclusive"
-	[ "$MODE" != checkout ] || [ -z "$BRANCH" ] || die "--checkout and --branch are mutually exclusive"
 	check_name "$NAME"
 fi
 
@@ -824,8 +848,11 @@ launch_claude() {        # $1 = worktree path, or the repo root for '--cd ..'
 		cwd=$REPO_ROOT
 	elif claude_worktree_name; then
 		# Claude Code resolves this name to exactly the worktree we have, so it
-		# reuses the one just created rather than making another.
-		CMD=(claude --worktree "$CLAUDE_NAME")
+		# reuses the one just created rather than making another. An unnamed
+		# --worktree session is auto-deleted, worktree and branch both, when a
+		# clean exit finds nothing worth keeping; naming the session after the
+		# same worktree turns that into a prompt instead.
+		CMD=(claude --worktree "$CLAUDE_NAME" --name "$CLAUDE_NAME")
 		cwd=$REPO_ROOT
 	else
 		CMD=(claude)
@@ -970,24 +997,28 @@ fi
 
 # ------------------------------------------------------------- start point ---
 
-START_POINT=${START_POINT:-HEAD}
+# --checkout attaches an existing branch as-is: there is no base branch to
+# resolve, and $NAME -- the branch itself -- is checked in the build step below.
+if [ "$MODE" != checkout ]; then
+	START_POINT=${START_POINT:-HEAD}
 
-resolve() { git rev-parse --verify --quiet "$1^{commit}" >/dev/null 2>&1; }
+	resolve() { git rev-parse --verify --quiet "$1^{commit}" >/dev/null 2>&1; }
 
-if ! resolve "$START_POINT"; then
-	# Unknown ref: if it looks like <known-remote>/<branch>, try fetching it once.
-	remote=${START_POINT%%/*}
-	rest=${START_POINT#*/}
-	if [ "$DO_FETCH" -eq 1 ] && [ "$remote" != "$START_POINT" ] \
-		&& git remote | grep -Fxq "$remote"; then
-		info "start point '$START_POINT' unknown, fetching from $remote..."
-		[ "$DRY_RUN" -eq 1 ] || git fetch --quiet "$remote" "$rest" || true
+	if ! resolve "$START_POINT"; then
+		# Unknown ref: if it looks like <known-remote>/<branch>, try fetching it once.
+		remote=${START_POINT%%/*}
+		rest=${START_POINT#*/}
+		if [ "$DO_FETCH" -eq 1 ] && [ "$remote" != "$START_POINT" ] \
+			&& git remote | grep -Fxq "$remote"; then
+			info "start point '$START_POINT' unknown, fetching from $remote..."
+			[ "$DRY_RUN" -eq 1 ] || git fetch --quiet "$remote" "$rest" || true
+		fi
+		resolve "$START_POINT" || die "cannot resolve start point: $START_POINT"
 	fi
-	resolve "$START_POINT" || die "cannot resolve start point: $START_POINT"
-fi
 
-IS_REMOTE_REF=0
-git show-ref --verify --quiet "refs/remotes/$START_POINT" && IS_REMOTE_REF=1 || true
+	IS_REMOTE_REF=0
+	git show-ref --verify --quiet "refs/remotes/$START_POINT" && IS_REMOTE_REF=1 || true
+fi
 
 # --------------------------------------------------------------- worktrees ---
 
@@ -1012,27 +1043,26 @@ if [ "$ALREADY" -eq 0 ]; then
 			ADD_ARGS+=(--detach "$WT_PATH" "$START_POINT")
 			;;
 		checkout)
-			branch_exists "$START_POINT" || die "not an existing local branch: $START_POINT (drop --checkout to create one)"
-			if [ "$FORCE" -eq 0 ] && branch_in_use "$START_POINT"; then
-				die "branch '$START_POINT' is already checked out in another worktree (use --force)"
+			branch_exists "$NAME" || die "not an existing local branch: $NAME (drop --checkout to create one)"
+			if [ "$FORCE" -eq 0 ] && branch_in_use "$NAME"; then
+				die "branch '$NAME' is already checked out in another worktree (use --force)"
 			fi
-			ADD_ARGS+=("$WT_PATH" "$START_POINT")
+			ADD_ARGS+=("$WT_PATH" "$NAME")
 			;;
 		new)
-			BRANCH=${BRANCH:-$NAME}
-			git check-ref-format --branch "$BRANCH" >/dev/null 2>&1 \
-				|| die "invalid branch name: $BRANCH (use --branch to pick another)"
-			if branch_exists "$BRANCH" && [ "$RESET_BRANCH" -eq 0 ]; then
-				if [ "$FORCE" -eq 0 ] && branch_in_use "$BRANCH"; then
-					die "branch '$BRANCH' is already checked out in another worktree (use --force, -B to reset, or --branch)"
+			git check-ref-format --branch "$NAME" >/dev/null 2>&1 \
+				|| die "invalid branch name: $NAME"
+			if branch_exists "$NAME" && [ "$RESET_BRANCH" -eq 0 ]; then
+				if [ "$FORCE" -eq 0 ] && branch_in_use "$NAME"; then
+					die "branch '$NAME' is already checked out in another worktree (use --force or -B to reset)"
 				fi
-				warn "branch '$BRANCH' already exists; checking it out (start point '$START_POINT' ignored, use -B to reset it)"
-				ADD_ARGS+=("$WT_PATH" "$BRANCH")
+				warn "branch '$NAME' already exists; checking it out (base branch '$START_POINT' ignored, use -B to reset it)"
+				ADD_ARGS+=("$WT_PATH" "$NAME")
 			else
 				if [ "$RESET_BRANCH" -eq 1 ]; then
-					ADD_ARGS+=(-B "$BRANCH")
+					ADD_ARGS+=(-B "$NAME")
 				else
-					ADD_ARGS+=(-b "$BRANCH")
+					ADD_ARGS+=(-b "$NAME")
 				fi
 				[ "$IS_REMOTE_REF" -eq 1 ] && ADD_ARGS+=(--track)
 				ADD_ARGS+=("$WT_PATH" "$START_POINT")
