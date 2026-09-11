@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # cworktree — create a git worktree under <repo-root>/.claude/worktrees/<name>
-#                   and optionally launch Claude Code in it.
+#                   and optionally launch Claude Code or Codex in it.
 #
 # Works from anywhere inside a git repository (including from another worktree);
 # worktrees are always created relative to the *main* repository root.
@@ -27,9 +27,16 @@ CLAUDE_NAME_MAX=64
 # Arguments to pass to `claude` when -c/--claude is given without any; nothing
 # is passed by default.
 DEFAULT_CLAUDE_ARGS=${CWORKTREE_CLAUDE_ARGS-}
-# Prefix of the last stdout line when the shell wrapper asked for the claude
-# command line instead of a session, i.e. --cd together with -c/--claude: it has
-# to cd first, so it evaluates the command itself.
+# The same for `codex` and -x/--codex.
+DEFAULT_CODEX_ARGS=${CWORKTREE_CODEX_ARGS-}
+# codex takes the same five effort levels as claude, but as a config override
+# rather than a flag of its own -- the one thing -x/--codex has to translate
+# instead of passing through: --effort max becomes
+# `-c model_reasoning_effort="max"`.
+CODEX_EFFORT_KEY=model_reasoning_effort
+# Prefix of the last stdout line when the shell wrapper asked for the session's
+# command line instead of the session, i.e. --cd together with -c/--claude or
+# -x/--codex: it has to cd first, so it evaluates the command itself.
 LAUNCH_MARKER=__cworktree_launch__
 
 if [ -t 2 ]; then
@@ -47,7 +54,7 @@ usage() {
 	cat <<EOF
 Usage: $PROG [options] <new-branch-name> [<base-branch-name>|HEAD]
        $PROG --checkout <attached-branch-name> [options]
-       $PROG <name>|.. --cd [-c]
+       $PROG <name>|.. --cd [-c|-x]
        $PROG [<name>...] -D|--delete [-f]
        $PROG -l|--list
        $PROG --shell-init [bash|zsh]
@@ -85,7 +92,7 @@ Worktree:
       --no-exclude      do not add the base dir to .git/info/exclude
       --no-fetch        do not auto-fetch when a remote branch is unknown
 
-Claude Code:
+Agent session:
   -c, --claude [args]   after a successful create, run in this terminal:
                           claude --worktree <name> --name <name> [args]
                         naming the session after the worktree keeps
@@ -98,17 +105,27 @@ Claude Code:
                         and is not a $PROG option; otherwise write
                         --claude=<args>. Omitted, \$CWORKTREE_CLAUDE_ARGS
                         is used instead.
+  -x, --codex [args]    the same for Codex: cd into the worktree and run
+                        \`codex [args]\` there. codex has no --worktree
+                        aimed at an existing worktree -- its own makes a
+                        new one -- so the session simply starts inside
+                        ours. [args] works exactly like -c's, with
+                        \$CWORKTREE_CODEX_ARGS as the default. Mutually
+                        exclusive with -c/--claude
   -e, --effort <level>  pass --effort <level> to claude: low, medium,
                         high, xhigh, max -- each also its own flag,
-                        --low ... --max. Implies -c/--claude
-      --                the rest, joined into one string, is claude's
-                        [prompt]; implies -c/--claude
+                        --low ... --max. With -x/--codex the same five
+                        levels go as \`-c $CODEX_EFFORT_KEY="<level>"\`,
+                        which is how codex takes them. Implies a session,
+                        -c/--claude unless -x/--codex says otherwise
+      --                the rest, joined into one string, is the
+                        session's [prompt]; implies a session too
 
 Navigation and cleanup:
       --cd [name]       print an existing worktree's path, for the shell
                         wrapper to cd into; '..' is the repo root. With
-                        -c/--claude the shell cds there first and launches
-                        claude afterwards
+                        -c/--claude or -x/--codex the shell cds there
+                        first and starts the session afterwards
   -D, --delete [name...]
                         \`git worktree remove\` the worktree; -f if it is
                         dirty, -ff if it is locked. Several names remove
@@ -133,6 +150,7 @@ Other:
 Environment:
   CWORKTREE_CLAUDE_ARGS default claude arguments, for -c/--claude given
                         without [args] of its own, e.g. '--chrome'
+  CWORKTREE_CODEX_ARGS  the same for -x/--codex, e.g. '--search'
   CWORKTREE_DIR         default base dir for worktrees (see -d/--dir)
 
 Shell integration (a child cannot cd its parent, hence the wrapper):
@@ -146,6 +164,8 @@ Examples:
   $PROG --checkout feature/x          # attach an existing branch
   $PROG fix-login -c '--chrome'       # claude, with --chrome
   $PROG fix-login --max               # claude at max effort
+  $PROG fix-login -x                  # codex instead of claude
+  $PROG fix-login -x --max            # ... at max effort
   $PROG fix-login -c -- fix the login # ... with a prompt
   $PROG fix-login --cd                # cd into the worktree
   $PROG fix-login --cd -c             # cd there, then claude
@@ -164,6 +184,7 @@ CHECKOUT_TARGET=      # branch given directly to --checkout, see opt_arg
 BASE_DIR=$DEFAULT_BASE_DIR
 MODE=new            # new | checkout | detach
 LAUNCH=0
+AGENT=               # claude | codex: which one -c/--claude and -x/--codex run
 RESET_BRANCH=0
 FORCE=0              # -f/--force, counted: a second one reaches worktree remove
 DO_EXCLUDE=1
@@ -182,10 +203,10 @@ DEL_TARGET=           # name given to -D/--delete itself
 DEL_TARGETS=()        # every worktree -D/--delete was asked to remove
 POS=()                # positional arguments, in order
 SHELL_INIT=
-EFFORT=              # claude --effort <level>
-LAUNCH_ARGS=()       # from -c/--claude, or $CWORKTREE_CLAUDE_ARGS
+EFFORT=              # claude --effort <level>, codex $CODEX_EFFORT_KEY
+LAUNCH_ARGS=()       # from -c/-x, or $CWORKTREE_{CLAUDE,CODEX}_ARGS
 LAUNCH_ARGS_SET=0
-PROMPT=              # everything after --, as one string: claude's [prompt]
+PROMPT=              # everything after --, one string: the session's [prompt]
 SPLIT_ARGS=()
 OPT_ARG=             # last optional option argument, see opt_arg
 
@@ -261,14 +282,15 @@ shell_split() {
 	return "$rc"
 }
 
-add_launch_args() {  # $1 = string of claude arguments, $2 = source, for errors
+add_launch_args() {  # $1 = string of agent arguments, $2 = source, for errors
 	shell_split "$1" || die "cannot parse $2: $1"
 	LAUNCH_ARGS_SET=1
 	[ "${#SPLIT_ARGS[@]}" -eq 0 ] || LAUNCH_ARGS+=("${SPLIT_ARGS[@]}")
 }
 
-# An effort level is only useful together with claude, so asking for one asks
-# for a session too.
+# An effort level is only useful together with a session, so asking for one asks
+# for a session too; which program runs it stays -c/--claude's or -x/--codex's
+# to say, on either side of this on the line.
 set_effort() {       # $1 = effort level
 	case $1 in
 		low|medium|high|xhigh|max) ;;
@@ -278,15 +300,27 @@ set_effort() {       # $1 = effort level
 	LAUNCH=1
 }
 
-# The argument of -c/--claude is optional, so only take the next word when it
-# can only have been meant for claude: option-looking, and none of ours.
-is_claude_args() {
+# One terminal runs one session, so -c/--claude and -x/--codex name the program
+# that gets it rather than adding to a list: the second one on the line is a
+# mistake, not a change of mind.
+set_agent() {        # $1 = claude | codex
+	if [ -n "$AGENT" ] && [ "$AGENT" != "$1" ]; then
+		die "-c/--claude and -x/--codex are mutually exclusive"
+	fi
+	AGENT=$1
+	LAUNCH=1
+}
+
+# The argument of -c/--claude and -x/--codex is optional, so only take the next
+# word when it can only have been meant for the session: option-looking, and
+# none of ours.
+is_agent_args() {
 	case $1 in
-		-h|--help|-c|--claude|-e|--effort|--low|--medium|--high|--xhigh|--max\
+		-h|--help|-c|--claude|-x|--codex|-e|--effort|--low|--medium|--high|--xhigh|--max\
 		|-B|--reset-branch|--checkout\
 		|--detach|-f|--force|-d|--dir|--no-exclude|--no-fetch|-p|--path\
 		|--cd|-D|--delete|-l|--list|--shell-init|-n|--dry-run|--) return 1 ;;
-		--claude=*|--effort=*|--checkout=*|--dir=*|--cd=*|--delete=*|--shell-init=*) return 1 ;;
+		--claude=*|--codex=*|--effort=*|--checkout=*|--dir=*|--cd=*|--delete=*|--shell-init=*) return 1 ;;
 		-?*) return 0 ;;
 		*) return 1 ;;
 	esac
@@ -296,12 +330,19 @@ while [ "$#" -gt 0 ]; do
 	case $1 in
 		-h|--help)          usage; exit 0 ;;
 		-c|--claude)
-			LAUNCH=1
-			if [ "$#" -ge 2 ] && is_claude_args "$2"; then
+			set_agent claude
+			if [ "$#" -ge 2 ] && is_agent_args "$2"; then
 				add_launch_args "$2" "claude arguments"; shift
 			fi
 			;;
-		--claude=*)         LAUNCH=1; add_launch_args "${1#*=}" "claude arguments" ;;
+		--claude=*)         set_agent claude; add_launch_args "${1#*=}" "claude arguments" ;;
+		-x|--codex)
+			set_agent codex
+			if [ "$#" -ge 2 ] && is_agent_args "$2"; then
+				add_launch_args "$2" "codex arguments"; shift
+			fi
+			;;
+		--codex=*)          set_agent codex; add_launch_args "${1#*=}" "codex arguments" ;;
 		-e|--effort)        need_arg "$@"; set_effort "$2"; shift ;;
 		--effort=*)         set_effort "${1#*=}" ;;
 		--low|--medium|--high|--xhigh|--max) set_effort "${1#--}" ;;
@@ -326,7 +367,7 @@ while [ "$#" -gt 0 ]; do
 			;;
 		--shell-init=*)     SHELL_INIT=${1#*=} ;;
 		-n|--dry-run)       DRY_RUN=1 ;;
-		--)                 # the rest is claude's [prompt], as a single argument
+		--)                 # the rest is the session's [prompt], as one argument
 			shift
 			if [ "$#" -gt 0 ]; then PROMPT=$*; LAUNCH=1; fi
 			break
@@ -359,13 +400,21 @@ else
 	START_POINT=${POS[1]-}
 fi
 
-# -c/--claude without arguments of its own falls back to the environment.
+# -e/--effort and -- ask for a session without saying whose; claude's, then.
+[ "$LAUNCH" -eq 0 ] || [ -n "$AGENT" ] || AGENT=claude
+
+# -c/--claude or -x/--codex without arguments of its own falls back to the
+# environment -- to its own variable, so both can be set at once.
 if [ "$LAUNCH" -eq 1 ] && [ "$LAUNCH_ARGS_SET" -eq 0 ]; then
-	add_launch_args "$DEFAULT_CLAUDE_ARGS" '$CWORKTREE_CLAUDE_ARGS'
+	if [ "$AGENT" = codex ]; then
+		add_launch_args "$DEFAULT_CODEX_ARGS" '$CWORKTREE_CODEX_ARGS'
+	else
+		add_launch_args "$DEFAULT_CLAUDE_ARGS" '$CWORKTREE_CLAUDE_ARGS'
+	fi
 fi
 
-# Only the shell itself can change its directory, so --cd with -c/--claude is a
-# two-step affair: the wrapper sets this, we print the claude command line
+# Only the shell itself can change its directory, so --cd with a session is a
+# two-step affair: the wrapper sets this, we print the session's command line
 # instead of running it, and the wrapper evaluates it after the cd.
 DEFER_LAUNCH=0
 if [ "${CWORKTREE_DEFER_LAUNCH-}" = 1 ] && [ "$DO_CD" -eq 1 ] && [ "$LAUNCH" -eq 1 ]; then
@@ -411,7 +460,8 @@ shell_init() {
 		    case \$__cw_arg in
 		      --) __cw_run=1; break ;;
 		      --cd|--cd=*) __cw_cd=1 ;;
-		      -c|--claude|--claude=*|-e|--effort|--effort=*|--low|--medium|--high|--xhigh|--max) __cw_run=1 ;;
+		      -c|--claude|--claude=*|-x|--codex|--codex=*) __cw_run=1 ;;
+		      -e|--effort|--effort=*|--low|--medium|--high|--xhigh|--max) __cw_run=1 ;;
 		    esac
 		    __cw_prev=\$__cw_arg
 		  done
@@ -419,7 +469,7 @@ shell_init() {
 		    "\$__cworktree_bin" "\$@"
 		    return \$?
 		  fi
-		  # --cd asking for a claude session too: take the command line, cd, run it.
+		  # --cd asking for a session too: take the command line, cd, run it.
 		  if [ "\$__cw_run" -eq 1 ]; then
 		    __cw_out=\$(CWORKTREE_DEFER_LAUNCH=1 "\$__cworktree_bin" "\$@") || return \$?
 		  else
@@ -497,7 +547,7 @@ shell_init() {
 			    --shell-init) compadd bash zsh; return ;;
 			  esac
 			  if [[ $cur == -* ]]; then
-			    cands=(-c --claude -e --effort --low --medium --high --xhigh --max
+			    cands=(-c --claude -x --codex -e --effort --low --medium --high --xhigh --max
 			           -B --reset-branch --checkout --detach
 			           -f --force -d --dir --no-exclude --no-fetch -p --path
 			           --cd -D --delete -l --list --shell-init -n --dry-run -h --help)
@@ -526,7 +576,7 @@ shell_init() {
 			  for (( i = 1; i < COMP_CWORD; i++ )); do
 			    case ${COMP_WORDS[i]} in -D|--delete|--delete=*) del=1 ;; esac
 			  done
-			  opts='-c --claude -e --effort --low --medium --high --xhigh --max
+			  opts='-c --claude -x --codex -e --effort --low --medium --high --xhigh --max
 			        -B --reset-branch --checkout --detach
 			        -f --force -d --dir --no-exclude --no-fetch -p --path
 			        --cd -D --delete -l --list --shell-init -n --dry-run -h --help'
@@ -605,7 +655,7 @@ fi
 if [ "$DO_LIST" -eq 1 ] || [ "$DO_DELETE" -eq 1 ]; then
 	[ "$DO_LIST" -eq 0 ] || [ "$DO_DELETE" -eq 0 ] || die "--list and --delete are mutually exclusive"
 	[ "$DO_CD" -eq 0 ] || die "--cd cannot be combined with --list or --delete"
-	[ "$LAUNCH" -eq 0 ] || die "-c/--claude cannot be combined with --list or --delete"
+	[ "$LAUNCH" -eq 0 ] || die "-c/--claude and -x/--codex cannot be combined with --list or --delete"
 	[ "$PRINT_PATH" -eq 0 ] || die "-p/--path cannot be combined with --list or --delete"
 fi
 
@@ -835,32 +885,45 @@ claude_worktree_name() {
 	return 0
 }
 
-# Build the claude command line for the worktree at $1 and run it — or, when the
-# shell wrapper has to cd first (--cd together with -c/--claude), print it for
-# the wrapper to evaluate once it has.
-launch_claude() {        # $1 = worktree path, or the repo root for '--cd ..'
+# Build the session's command line for the worktree at $1 and run it — or, when
+# the shell wrapper has to cd first (--cd together with -c/--claude or
+# -x/--codex), print it for the wrapper to evaluate once it has.
+launch_agent() {         # $1 = worktree path, or the repo root for '--cd ..'
 	local wt_path=$1 cwd
-	command -v claude >/dev/null 2>&1 || die "claude not found in PATH"
+	command -v "$AGENT" >/dev/null 2>&1 || die "$AGENT not found in PATH"
 
-	if [ "$wt_path" = "$REPO_ROOT" ]; then
-		# '--cd ..': no worktree involved, just a session at the top.
-		CMD=(claude)
-		cwd=$REPO_ROOT
-	elif claude_worktree_name; then
-		# Claude Code resolves this name to exactly the worktree we have, so it
-		# reuses the one just created rather than making another. An unnamed
-		# --worktree session is auto-deleted, worktree and branch both, when a
-		# clean exit finds nothing worth keeping; naming the session after the
-		# same worktree turns that into a prompt instead.
-		CMD=(claude --worktree "$CLAUDE_NAME" --name "$CLAUDE_NAME")
-		cwd=$REPO_ROOT
-	else
-		CMD=(claude)
+	if [ "$AGENT" = codex ]; then
+		# codex has no --worktree to aim at a worktree that is already there --
+		# its own always makes a new one -- so the session just starts inside
+		# ours, which is also what makes `codex resume` find it again: its picker
+		# filters by the directory the session ran in.
+		CMD=(codex)
 		cwd=$wt_path
+		# The same five levels as claude's --effort, but codex takes them as a
+		# config override rather than a flag of its own.
+		[ -z "$EFFORT" ] || CMD+=(-c "$CODEX_EFFORT_KEY=\"$EFFORT\"")
+	else
+		if [ "$wt_path" = "$REPO_ROOT" ]; then
+			# '--cd ..': no worktree involved, just a session at the top.
+			CMD=(claude)
+			cwd=$REPO_ROOT
+		elif claude_worktree_name; then
+			# Claude Code resolves this name to exactly the worktree we have, so it
+			# reuses the one just created rather than making another. An unnamed
+			# --worktree session is auto-deleted, worktree and branch both, when a
+			# clean exit finds nothing worth keeping; naming the session after the
+			# same worktree turns that into a prompt instead.
+			CMD=(claude --worktree "$CLAUDE_NAME" --name "$CLAUDE_NAME")
+			cwd=$REPO_ROOT
+		else
+			CMD=(claude)
+			cwd=$wt_path
+		fi
+		[ -z "$EFFORT" ] || CMD+=(--effort "$EFFORT")
 	fi
-	[ -z "$EFFORT" ] || CMD+=(--effort "$EFFORT")
 	[ "${#LAUNCH_ARGS[@]}" -eq 0 ] || CMD+=("${LAUNCH_ARGS[@]}")
-	# Everything after '--' is a single argument: claude's [prompt].
+	# Everything after '--' is a single argument: the session's [prompt], which
+	# claude and codex both take as their trailing positional.
 	[ -z "$PROMPT" ] || CMD+=("$PROMPT")
 
 	info "+ ${CMD[*]}"
@@ -981,7 +1044,7 @@ if [ "$CD_ONLY" -eq 1 ]; then
 	esac
 	# Only the path goes to stdout: the shell wrapper cds into it.
 	printf '%s\n' "$CD_PATH"
-	[ "$LAUNCH" -eq 0 ] || launch_claude "$CD_PATH"
+	[ "$LAUNCH" -eq 0 ] || launch_agent "$CD_PATH"
 	[ -t 1 ] || exit 0
 	info "run \`eval \"\$($PROG --shell-init)\"\` to make --cd change directory"
 	exit 0
@@ -1100,7 +1163,7 @@ if [ "$DRY_RUN" -eq 0 ]; then
 fi
 printf '%s\n' "$WT_PATH"
 
-# ------------------------------------------------------------------ claude ---
+# ----------------------------------------------------------------- session ---
 
 [ "$LAUNCH" -eq 1 ] || exit 0
-launch_claude "$WT_PATH"
+launch_agent "$WT_PATH"

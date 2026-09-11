@@ -1,7 +1,8 @@
 # cworktree
 
 Create a git worktree under `<repo-root>/.claude/worktrees/<name>` — and, optionally,
-launch [Claude Code](https://claude.com/claude-code) in it.
+launch [Claude Code](https://claude.com/claude-code) or
+[Codex](https://developers.openai.com/codex/cli) in it.
 
 A single dependency-free bash script. It works from anywhere inside a repository,
 including from another worktree: the path is always resolved against the **main**
@@ -49,6 +50,8 @@ cworktree --checkout feature/x            # attach an existing branch
 cworktree fix-login --claude              # ... then launch Claude Code in it
 cworktree fix-login --effort high         # ... with a high effort level
 cworktree fix-login --max                 # ... same as --effort max
+cworktree fix-login -x                    # ... launch Codex instead
+cworktree fix-login -x --max              # ... at max effort
 cworktree fix-login -c -- fix the login   # ... with a prompt for the session
 cworktree fix-login --cd                  # cd into the worktree
 cworktree fix-login --cd -c               # cd into it, then launch claude there
@@ -97,7 +100,8 @@ given.
 | Option | Meaning |
 | --- | --- |
 | `-c, --claude [args]` | after a successful create, launch Claude Code in the worktree |
-| `-e, --effort <level>` | pass `--effort <level>` to `claude` (`low`, `medium`, `high`, `xhigh`, `max`); implies `-c`. Also as its own flag: `--low`, `--medium`, `--high`, `--xhigh`, `--max` |
+| `-x, --codex [args]` | the same for Codex: `codex [args]`, run inside the worktree. Mutually exclusive with `-c`; `[args]` and `$CWORKTREE_CODEX_ARGS` work exactly like `-c`'s |
+| `-e, --effort <level>` | pass `--effort <level>` to `claude` (`low`, `medium`, `high`, `xhigh`, `max`); implies a session, `-c` unless `-x` is given. Also as its own flag: `--low`, `--medium`, `--high`, `--xhigh`, `--max`. With `-x` the same five levels go to codex as `-c model_reasoning_effort="<level>"` |
 | `-B, --reset-branch` | reset the branch to the base branch if it already exists |
 | `--checkout <name>` | attach an existing branch instead of creating one; the worktree is named after it, exactly like a new branch |
 | `--detach` | detached HEAD at the start point, no branch |
@@ -118,9 +122,9 @@ given.
 > branch, so there is no longer a separate name to give it.
 
 Re-running the same command is a no-op if the worktree already exists (with
-`--claude`, it just starts a new session there).
+`-c`/`-x`, it just starts a new session there).
 
-## Launching Claude Code
+## Launching Claude Code or Codex
 
 `-c`/`--claude` runs, in the current terminal:
 
@@ -142,29 +146,50 @@ worktree still nested by an older cworktree — cworktree says so and starts a
 plain `claude` inside the worktree instead, with neither flag: Claude Code
 never created that worktree, so it never auto-deletes it either.
 
-No claude flags are hardcoded, apart from `--worktree`/`--name` and
-`--effort <level>` when you ask for one (`-e`/`--effort`, or the shorthands
-`--low` … `--max`). Asking for an effort level implies `-c`, since it is only
-useful with a session; it is inserted before the arguments below, so anything
+`-x`/`--codex` starts Codex instead, as `codex [args]` run from inside the
+worktree. There is no `--worktree` to pass: codex's own always creates a new
+worktree rather than pointing at one that is already there, so there is no name
+for the two sides to agree on — and nothing that would delete the worktree on
+exit either. Starting the session in the directory is also what lets
+`codex resume` find it again, since its picker filters by the directory a
+session ran in. `-c` and `-x` are mutually exclusive: one terminal, one session.
+
+An effort level is the one thing translated rather than passed through, because
+codex takes it as a config override instead of a flag — the five level names
+are the same on both sides:
+
+```sh
+cworktree fix-login --max        # claude --worktree fix-login --name fix-login --effort max
+cworktree fix-login -x --max     # codex -c model_reasoning_effort="max"
+```
+
+No claude or codex flags are hardcoded, apart from `--worktree`/`--name` and
+the effort level when you ask for one (`-e`/`--effort`, or the shorthands
+`--low` … `--max`). Asking for an effort level implies a session, since it is
+only useful with one; it is inserted before the arguments below, so anything
 you pass yourself comes later on the command line — including your own
 `--name`, if you would rather override the default.
 
 Extra arguments come from, in order of precedence:
 
-1. **`-c '<args>'`** — a single string, parsed like a shell command line, so
-   quoting works: `cworktree fix-login -c '--chrome -p "look at the tests"'`.
-   The string is only recognised as claude arguments when it starts with `-` and
-   is not a cworktree option; for anything else write `--claude='<args>'`.
-2. **`$CWORKTREE_CLAUDE_ARGS`** — your default, used when `-c` is given without
-   arguments of its own.
+1. **`-c '<args>'`** (or **`-x '<args>'`**) — a single string, parsed like a
+   shell command line, so quoting works:
+   `cworktree fix-login -c '--chrome -p "look at the tests"'`. The string is
+   only recognised as agent arguments when it starts with `-` and is not a
+   cworktree option; for anything else write `--claude='<args>'` or
+   `--codex='<args>'`.
+2. **`$CWORKTREE_CLAUDE_ARGS`**, or **`$CWORKTREE_CODEX_ARGS`** for `-x` — your
+   default, used when the flag is given without arguments of its own. Each is
+   only read for its own agent, so both can be set at once.
 3. **After `--`** — everything left is joined with spaces into *one* argument and
-   appended last, which is what `claude` takes as its `[prompt]`:
-   `cworktree fix-login -- look at the failing tests`. Since it is a single
-   argument, put claude *flags* in `-c '<args>'` rather than after `--`.
+   appended last, which is what `claude` and `codex` both take as their
+   `[prompt]`: `cworktree fix-login -- look at the failing tests`. Since it is a
+   single argument, put agent *flags* in `-c '<args>'` rather than after `--`.
 
 ```sh
 # ~/.bashrc or ~/.zshrc
 export CWORKTREE_CLAUDE_ARGS='--chrome'
+export CWORKTREE_CODEX_ARGS='--search'
 ```
 
 > `--dangerously-skip-permissions` is a convenient thing to put in
@@ -176,18 +201,20 @@ export CWORKTREE_CLAUDE_ARGS='--chrome'
 | Variable | Meaning |
 | --- | --- |
 | `CWORKTREE_CLAUDE_ARGS` | default arguments for `claude` with `-c`/`--claude` |
+| `CWORKTREE_CODEX_ARGS` | default arguments for `codex` with `-x`/`--codex` |
 | `CWORKTREE_DIR` | default base dir for worktrees (see `-d`/`--dir`) |
 
 ## Navigating and cleaning up
 
 `--cd` prints the path of an existing worktree; with the shell wrapper installed
 your shell moves there. It never creates anything on its own — a typo is an
-error, not a new worktree — but combined with `-c`/`--claude` (which does create
-one when it is missing) the shell cds in first and then starts the session, so
-you are left in the worktree when claude exits:
+error, not a new worktree — but combined with `-c`/`--claude` or `-x`/`--codex`
+(which do create one when it is missing) the shell cds in first and then starts
+the session, so you are left in the worktree when it exits:
 
 ```sh
 cworktree fix-login --cd -c --high     # create if needed, cd there, then claude
+cworktree fix-login --cd -x            # ... or codex
 cworktree --cd ..                      # back to the repo root
 ```
 
